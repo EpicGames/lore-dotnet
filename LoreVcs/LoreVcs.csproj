@@ -1,0 +1,51 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net9.0</TargetFramework>
+        <Nullable>enable</Nullable>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <NoWarn>1591</NoWarn> <!-- suppress "missing XML comment" warnings -->
+
+        <!-- Package name is overridable for custom builds (e.g. LoreVcsPrivate)
+             via the LORE_PACKAGE_NAME env var; defaults to the open-source name.
+             First non-empty wins: -p:LorePackageName override, then env var, then default. -->
+        <LorePackageName Condition="'$(LorePackageName)'==''">$(LORE_PACKAGE_NAME)</LorePackageName>
+        <LorePackageName Condition="'$(LorePackageName)'==''">LoreVcs</LorePackageName>
+        <PackageId>$(LorePackageName)</PackageId>
+        <Authors>Unreal Cloud Services</Authors>
+        <Company>Epic Games Inc.</Company>
+        <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    </PropertyGroup>
+
+    <!--
+        This is the portable meta package: a single managed assembly plus
+        runtime.json. It contains NO native library. At restore time, NuGet
+        reads runtime.json and pulls only the matching LoreVcs.runtime.<rid>
+        package for the consumer's runtime identifier, so consumers download
+        just the native lib they need. A RID must be supplied when building or
+        running the consuming app (e.g. `dotnet run -r osx-arm64`) for the
+        native asset to be resolved.
+    -->
+    <ItemGroup>
+        <None Include="runtime.json" Pack="true" PackagePath="/" />
+        <None Include="../LICENSE" Pack="true" PackagePath="/" />
+    </ItemGroup>
+
+    <!--
+        Local development only: copy the host's native library next to the
+        build output so projects that consume LoreVcs via ProjectReference
+        (examples, LoreVcs.Tests, perf) load it without a RID. Guarded by
+        Exists so only the host lib (produced by find_lorelib.py) is picked
+        up, and Pack="false" so it never ends up in the meta package.
+    -->
+    <ItemGroup>
+        <None Include="../lore/lib/liblorelib.dylib" Condition="Exists('../lore/lib/liblorelib.dylib')"
+            Pack="false" CopyToOutputDirectory="PreserveNewest" />
+        <None Include="../lore/lib/liblorelib.so" Condition="Exists('../lore/lib/liblorelib.so')"
+            Pack="false" CopyToOutputDirectory="PreserveNewest" />
+        <None Include="../lore/lib/lorelib.dll" Condition="Exists('../lore/lib/lorelib.dll')"
+            Pack="false" CopyToOutputDirectory="PreserveNewest" />
+    </ItemGroup>
+
+</Project>

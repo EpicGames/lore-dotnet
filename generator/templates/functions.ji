@@ -1,0 +1,224 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+namespace LoreVcs.Interop;
+
+using System;
+using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
+using System.Threading.Tasks;
+
+using LoreVcs.Types;
+using LoreVcs.Types.Args;
+using LoreVcs.Types.Enums;
+using LoreVcs.Types.Events;
+
+{% import "utils.ji" as utils %}
+
+{% macro generate_blittable_type(symbol_type, struct_type, param_name)%}
+    {% for field in (symbols | attr(symbol_type))[struct_type] %}
+        {% set field_type = field.0 %}
+        {% set field_name = field.1 %}
+        {% if field_type in utils.disposable_types %}
+            {{ field_name }} = {{ field_type}}.ToBlittable({{ param_name }}.{{ pascal_case(field_name) }}),
+        {% elif field_type == "uint8_t"%}
+            {{ field_name }} = Convert.ToByte({{ param_name }}.{{ pascal_case(field_name) }}),
+        {% else %}
+            {{ field_name }} = {{ param_name }}.{{ pascal_case(field_name) }},
+        {% endif %}
+    {% endfor %}
+{% endmacro %}
+
+public static class Native
+{
+    // The native library ships under a uniform base name so a single managed
+    // assembly is portable across platforms. DllImport("lorelib") resolves to
+    // lorelib.dll (Windows), liblorelib.so (Linux), liblorelib.dylib (macOS).
+    const string LORELIB = "lorelib";
+
+    private static ConcurrentDictionary<ulong, (ulong userContext, TaskCompletionSource<int>?)> handles = new ConcurrentDictionary<ulong, (ulong userContext, TaskCompletionSource<int>?)>();
+
+    private unsafe static void InternalEventHandler(_LoreEvent* loreEvent, ulong handleId)
+    {
+        var callbackHandle = GCHandle.FromIntPtr((IntPtr)(nint)handleId);
+
+        if (!handles.TryGetValue(handleId, out var handleState) || !callbackHandle.IsAllocated)
+        {
+            // HandleId key does not exist in handles. Nothing to do but abort.
+            Console.Error.WriteLine("Unable to resolve handle.");
+            return;
+        }
+
+        if (callbackHandle.Target is not LoreCallback userCallback)
+        {
+            // HandleID key exists in handles but the handle's target is null or is not of type LoreCallback
+            Console.Error.WriteLine("Unable to resolve user callback.");
+            callbackHandle.Free();
+            handles.TryRemove(handleId, out _);
+            return;
+        }
+
+        using var ev = LoreEventFFI.From(loreEvent);
+        userCallback(ev, handleState.Item1);
+
+        if (loreEvent->Tag == LoreEventTag.COMPLETE && handleState.Item2 is not null)
+        {
+            handleState.Item2.TrySetResult(loreEvent->Complete.Status);
+        }
+
+        if (loreEvent->Tag == LoreEventTag.END)
+        {
+            callbackHandle.Free();
+            handles.TryRemove(handleId, out _);
+        }
+    }
+
+    {% for function_name, function_args in symbols.functions.items() %}
+        {% if function_name not in uncommon_functions %}
+            {#
+
+            Generates the function the user of the SDK will interact with. This function receives C# types and is responsible
+            of converting them into blittable types right before calling lorelib.
+            It is important to know that the blittable types are responsible of disposing any unmanaged resources, therefore
+            these are declared as `using var` as this will call the Dispose method when reaching the end of the function's scope.
+
+            For instance, for the function `lore_auth_interactive`
+
+            int32_t lore_auth_interactive(const struct lore_global_args_t *globals,
+                                        const struct lore_auth_interactive_args_t *args,
+                                        struct LoreEventCallbackConfig callback);
+
+            The result is:
+
+            public static unsafe int LoreAuthInteractive(
+                in LoreGlobalArgs globals,
+                in LoreAuthInteractiveArgs args,
+                LoreCallback callback
+            )
+            {
+                GCHandle callbackHandle = GCHandle.Alloc(callback);
+                ulong userContext = (ulong)GCHandle.ToIntPtr(callbackHandle).ToInt64();
+
+                var callback_config = new LoreEventCallbackConfig
+                {
+                    user_context = userContext,
+                    func = InternalEventHandler,
+                };
+                return lore_auth_interactive(globals, args, callback_config);
+            }
+
+            And the stub to the actual function in lorelib. Only blittable types can be passed.
+
+            [DllImport(LORELIB, CallingConvention = CallingConvention.Cdecl)]
+            internal static extern int lore_auth_interactive(
+                in LoreGlobalArgs globals,
+                in LoreAuthInteractiveArgs args,
+                LoreEventCallbackConfig callback
+            );
+
+            #}
+
+            {% if function_name in symbols.functions_comments %}
+                /**
+                * <summary>
+                * {{ "\n                * ".join(symbols.functions_comments[function_name]).replace("<", "&lt;").replace(">", "&gt;") }}
+                * </summary>
+                */
+            {% endif %}
+            {% if "async" not in function_name %}
+                {% set args_name = function_args.removesuffix("_t") %}
+                public unsafe static int {{ pascal_case(function_name) }}(
+                    in LoreGlobalArgs globals,
+                    in {{ pascal_case(args_name) }} args,
+                    LoreEventCallbackConfig callback)
+                {
+                    var callbackHandle = GCHandle.Alloc(callback.Func);
+                    var handleId = (ulong)(nuint)GCHandle.ToIntPtr(callbackHandle);
+
+                    if(!handles.TryAdd(handleId, (callback.UserContext, null))){
+                        Console.Error.WriteLine("Colliding callback handle.");
+                        callbackHandle.Free();
+                        return 4;
+                    }
+
+                    var internalCallback = new _LoreEventCallbackConfig {
+                        userContext = handleId,
+                        func = InternalEventHandler
+                    };
+
+                    return {{function_name}}(globals, args, internalCallback);
+                }
+
+                [DllImport(LORELIB, CallingConvention=CallingConvention.Cdecl)]
+                internal static extern int {{function_name}}(
+                    in LoreGlobalArgs globals,
+                    in {{ pascal_case(args_name) }} args,
+                    _LoreEventCallbackConfig callback);
+            {% else %}
+                {% set args_name = function_args.replace("_async", "").removesuffix("_t") %}
+                public unsafe static TaskCompletionSource<int> {{ pascal_case(function_name) }}(
+                    in LoreGlobalArgs globals,
+                    in {{ pascal_case(args_name) }} args,
+                    LoreEventCallbackConfig callback)
+                {
+                    var callbackHandle = GCHandle.Alloc(callback.Func);
+                    var handleId = (ulong)(nuint)GCHandle.ToIntPtr(callbackHandle);
+                    var taskCompletionSource = new TaskCompletionSource<int>();
+
+                    if(!handles.TryAdd(handleId, (callback.UserContext, taskCompletionSource))){
+                        taskCompletionSource.SetException(new InvalidOperationException("Colliding callback handle."));
+                        callbackHandle.Free();
+                        return taskCompletionSource;
+                    }
+
+                    var internalCallback = new _LoreEventCallbackConfig {
+                        userContext = handleId,
+                        func = InternalEventHandler
+                    };
+
+                    {{function_name}}(globals, args, internalCallback);
+                    return taskCompletionSource;
+                }
+
+                [DllImport(LORELIB, CallingConvention=CallingConvention.Cdecl)]
+                internal static extern void {{function_name}}(
+                    in LoreGlobalArgs globals,
+                    in {{ pascal_case(args_name) }} args,
+                    _LoreEventCallbackConfig callback);
+            {% endif %}
+        {% endif %}
+    {% endfor %}
+
+    public unsafe static int LoreLogConfigure(in LoreLogConfig logConfig)
+    {
+        return lore_log_configure(logConfig);
+    }
+
+    [DllImport(LORELIB, CallingConvention=CallingConvention.Cdecl)]
+    internal static extern int lore_log_configure(in LoreLogConfig logConfig);
+
+    public unsafe static int LoreSetThreadLimit(nuint count)
+    {
+        return lore_set_thread_limit(count);
+    }
+
+    [DllImport(LORELIB, CallingConvention=CallingConvention.Cdecl)]
+    internal static extern int lore_set_thread_limit(nuint count);
+
+    public unsafe static int LoreShutdown()
+    {
+        return lore_shutdown();
+    }
+
+    [DllImport(LORELIB, CallingConvention=CallingConvention.Cdecl)]
+    internal static extern int lore_shutdown();
+
+    public static string LoreVersion()
+    {
+        var ptr = lore_version();
+        var version = Marshal.PtrToStringUTF8(ptr);
+        return version ?? string.Empty;
+    }
+
+    [DllImport(LORELIB, CallingConvention=CallingConvention.Cdecl)]
+    internal static extern IntPtr lore_version();
+}

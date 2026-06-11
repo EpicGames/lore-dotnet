@@ -1,0 +1,249 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+{% import "utils.ji" as utils %}
+
+namespace LoreVcs;
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Threading.Channels;
+using System.Threading.Tasks;
+using System.Threading;
+using LoreVcs.Types;
+using LoreVcs.Types.Args;
+using LoreVcs.Types.Enums;
+using LoreVcs.Types.Events;
+using static LoreVcs.Interop.Native;
+
+public delegate int LoreFunction<LoreArgs>(in LoreGlobalArgs globalArgs, in LoreArgs args, LoreEventCallbackConfig callback);
+public delegate TaskCompletionSource<int> LoreFunctionAsync<LoreArgs>(in LoreGlobalArgs globalArgs, in LoreArgs args, LoreEventCallbackConfig callback);
+
+public sealed class LoreExecutor<LoreArgs>
+{
+    private LoreGlobalArgs globalArgs;
+    private LoreArgs args;
+    private LoreFunction<LoreArgs> function;
+    private LoreFunctionAsync<LoreArgs> functionAsync;
+    private LoreCallback callback = (LoreEventFFI loreEvent, ulong userContext) => {};
+    private HashSet<LoreEventTag> filterTags = new();
+    private List<LoreEvent> collectedEvents = new();
+    private Channel<LoreEvent> channel;
+    private ulong userContext;
+    private bool terminated;
+
+    private void WaitEventHandler(LoreEventFFI loreEvent, ulong userContext)
+    {
+        Lore.HandleGlobalCallbackEvent(loreEvent, userContext);
+        if (filterTags.Count > 0 && !filterTags.Contains(loreEvent.Tag)){
+            return;
+        }
+
+        callback(loreEvent, userContext);
+    }
+
+    private void CollectEventHandler(LoreEventFFI loreEvent, ulong userContext)
+    {
+        Lore.HandleGlobalCallbackEvent(loreEvent, userContext);
+        if (filterTags.Count > 0 && !filterTags.Contains(loreEvent.Tag)){
+            return;
+        }
+
+        callback(loreEvent, userContext);
+
+        collectedEvents.Add(loreEvent.Clone());
+    }
+
+    private void AsyncIterEventHandler(LoreEventFFI loreEvent, ulong userContext)
+    {
+        Lore.HandleGlobalCallbackEvent(loreEvent, userContext);
+        if (filterTags.Count > 0 && !filterTags.Contains(loreEvent.Tag)){
+            if (loreEvent.Tag == LoreEventTag.END)
+            {
+                channel.Writer.Complete();
+            }
+            return;
+        }
+
+        callback(loreEvent, userContext);
+
+        channel.Writer.TryWrite(loreEvent.Clone());
+
+        if (loreEvent.Tag == LoreEventTag.END)
+        {
+            channel.Writer.Complete();
+        }
+    }
+
+    public LoreExecutor(LoreGlobalArgs globalArgs, LoreArgs args, LoreFunction<LoreArgs> function, LoreFunctionAsync<LoreArgs> functionAsync)
+    {
+        this.globalArgs = globalArgs;
+        this.args = args;
+        this.function = function;
+        this.functionAsync = functionAsync;
+        this.channel = Channel.CreateUnbounded<LoreEvent>();
+    }
+
+    private void VerifyTermination()
+    {
+        if(terminated)
+        {
+            throw new InvalidOperationException("Already started");
+        }
+    }
+
+    public LoreExecutor<LoreArgs> Callback(LoreCallback callback)
+    {
+        this.callback = callback;
+        return this;
+    }
+
+    public LoreExecutor<LoreArgs> FilterByType(LoreEventTag[] filterTags)
+    {
+        this.filterTags = new HashSet<LoreEventTag>(filterTags);
+        return this;
+    }
+
+    public LoreExecutor<LoreArgs> UserContext(ulong userContext)
+    {
+        this.userContext = userContext;
+        return this;
+    }
+
+    public int Wait()
+    {
+        VerifyTermination();
+        terminated = true;
+        var callback = new LoreEventCallbackConfig { UserContext = userContext, Func = WaitEventHandler };
+        return function(globalArgs, args, callback);
+    }
+
+    public Task<int> WaitAsync()
+    {
+        VerifyTermination();
+        terminated = true;
+        var callback = new LoreEventCallbackConfig { UserContext = userContext, Func = WaitEventHandler };
+        return functionAsync(globalArgs, args, callback).Task;
+    }
+
+    public async IAsyncEnumerable<LoreEvent> AsyncIter()
+    {
+        VerifyTermination();
+        terminated = true;
+        var callback = new LoreEventCallbackConfig { UserContext = userContext, Func = AsyncIterEventHandler };
+        functionAsync(globalArgs, args, callback);
+        await foreach (var ev in channel.Reader.ReadAllAsync())
+        {
+            yield return ev;
+        }
+    }
+
+    public List<LoreEvent> Collect()
+    {
+        VerifyTermination();
+        terminated = true;
+
+        collectedEvents.Clear();
+        var callback = new LoreEventCallbackConfig { UserContext = userContext, Func = CollectEventHandler };
+        function(globalArgs, args, callback);
+        return collectedEvents;
+    }
+
+    public async Task<List<LoreEvent>> CollectAsync()
+    {
+        VerifyTermination();
+        terminated = true;
+
+        collectedEvents.Clear();
+        var callback = new LoreEventCallbackConfig { UserContext = userContext, Func = CollectEventHandler };
+        await functionAsync(globalArgs, args, callback).Task;
+        return collectedEvents;
+    }
+}
+
+public sealed class Lore
+{
+    private static readonly ConcurrentDictionary<LoreEventTag, ImmutableArray<LoreCallback>> event_subscriptions_by_event_type = new();
+
+    // Creation methods
+    {% for name, _ in symbols.functions.items() %}
+        {% if "async" not in name %}
+            {% set function_name = pascal_case(name)%}
+            {% set function_args = function_name + "Args" %}
+            {% if name not in uncommon_functions %}
+            {% if name in symbols.functions_comments %}
+    /**
+    * <summary>
+    * {{ "\n    * ".join(symbols.functions_comments[name]).replace("<", "&lt;").replace(">", "&gt;") }}
+    * </summary>
+    */
+            {% endif %}
+    public static LoreExecutor<{{ function_args }}> {{ function_name.removeprefix("Lore") }}(LoreGlobalArgs globalArgs, {{ function_args }} args)
+    {
+        return new LoreExecutor<{{ function_args }}>(globalArgs, args, {{ function_name }}, {{ function_name }}Async);
+    }
+            {% endif %}
+        {% endif %}
+    {% endfor %}
+
+    public static void LogConfigure(LoreLogConfig logConfig)
+    {
+        var result = LoreLogConfigure(logConfig);
+        if (result != 0) {
+            throw new InvalidOperationException("Lore Setup failed.");
+        }
+    }
+
+    public static int SetThreadLimit(nuint count)
+    {
+        return LoreSetThreadLimit(count);
+    }
+
+    public static void Shutdown()
+    {
+        var result = LoreShutdown();
+        if (result != 0) {
+            throw new InvalidOperationException("Lore Shutdown failed.");
+        }
+    }
+
+    public static IDisposable GlobalCallback(LoreEventTag event_type, LoreCallback callback)
+    {
+        event_subscriptions_by_event_type.AddOrUpdate(
+            event_type,
+            _ => ImmutableArray.Create(callback),
+            (_, arr) => arr.Add(callback)
+        );
+
+        return new Subscription(() => UnsubscribeGlobalCallback(event_type, callback));
+    }
+
+    private static void UnsubscribeGlobalCallback(LoreEventTag event_type, LoreCallback callback)
+    {
+        if (!event_subscriptions_by_event_type.TryGetValue(event_type, out _))
+            return;
+
+        event_subscriptions_by_event_type.AddOrUpdate(
+            event_type,
+            // won't be used because of the TryGetValue guard above, but needed by the API
+            _ => ImmutableArray<LoreCallback>.Empty,
+            (_, arr) => arr.Remove(callback));
+    }
+
+    internal static void HandleGlobalCallbackEvent(LoreEventFFI loreEvent, ulong userContext)
+    {
+        if (event_subscriptions_by_event_type.TryGetValue(loreEvent.Tag, out var callbacks)) {
+            for (int i = 0; i < callbacks.Length; i++) {
+                callbacks[i](loreEvent, userContext);
+            }
+        }
+    }
+
+    private sealed class Subscription : IDisposable
+    {
+        private Action? _dispose;
+        public Subscription(Action dispose) => _dispose = dispose;
+        public void Dispose() => Interlocked.Exchange(ref _dispose, null)?.Invoke();
+    }
+}

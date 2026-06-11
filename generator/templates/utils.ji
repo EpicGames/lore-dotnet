@@ -1,0 +1,35 @@
+{#
+The data registries (cs_map, init_map, blit_types, hardcoded_blit_classes,
+uncommon_functions) and the auto-detected `array_types` list are now built
+in Python and exposed as Jinja globals by `generator/common/registry.py`.
+They are accessed directly by name (no `utils.` prefix) inside templates.
+
+Only static helpers below stay here: `cs_allowed_fixed`, `reserved_words`,
+and the `escape_reserved_word` macro. Templates that need them still
+`{% import "utils.ji" as utils %}` and reference `utils.cs_allowed_fixed`,
+`utils.escape_reserved_word(...)`.
+#}
+
+{% set cs_allowed_fixed = [
+    "bool",
+    "byte",
+    "short",
+    "int",
+    "long",
+    "char",
+    "sbyte",
+    "ushort",
+    "uint",
+    "ulong",
+    "float",
+    "double"
+]%}
+
+{% set reserved_words = [
+    "fixed",
+    "value",
+] %}
+
+{% macro escape_reserved_word(word) %}
+    {% if word in reserved_words %}{{ "_" + word }}{% else %}{{ word }}{% endif %}
+{% endmacro %}

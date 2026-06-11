@@ -1,0 +1,75 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <!--
+        Runtime (native-asset) package. Building this project produces a single
+        LoreVcs.runtime.<rid> package containing ONLY the host platform's native
+        library under runtimes/<rid>/native. The portable LoreVcs meta package's
+        runtime.json points consumers at the matching one of these per RID.
+
+        There is no cross-compilation: find_lorelib.py fetches only the host's
+        native lib, so this project must be packed once on each target host
+        (osx-arm64, linux-x64, win-x64).
+    -->
+
+    <PropertyGroup>
+        <TargetFramework>net9.0</TargetFramework>
+
+        <!-- Native-only package: no managed assembly, no transitive deps. -->
+        <IncludeBuildOutput>false</IncludeBuildOutput>
+        <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+        <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+        <Authors>Unreal Cloud Services</Authors>
+        <Company>Epic Games Inc.</Company>
+        <PackageLicenseFile>LICENSE</PackageLicenseFile>
+        <!-- NU5128: no lib/ref assemblies (expected for a native-only package). -->
+        <NoWarn>$(NoWarn);NU5128</NoWarn>
+    </PropertyGroup>
+
+    <!-- Detect host OS + architecture; do not assume arch from OS. -->
+    <PropertyGroup>
+        <HostArch>$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)</HostArch>
+        <IsWindows Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Windows)))' == 'true'">true</IsWindows>
+        <IsOSX Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::OSX)))' == 'true'">true</IsOSX>
+        <IsLinux Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))' == 'true'">true</IsLinux>
+    </PropertyGroup>
+
+    <!-- Map (OS, arch) -> RID + native filename for the supported targets. -->
+    <PropertyGroup>
+        <LoreRid Condition="'$(IsWindows)'=='true' And '$(HostArch)'=='X64'">win-x64</LoreRid>
+        <LoreNativeLib Condition="'$(IsWindows)'=='true' And '$(HostArch)'=='X64'">lorelib.dll</LoreNativeLib>
+
+        <LoreRid Condition="'$(IsOSX)'=='true' And '$(HostArch)'=='Arm64'">osx-arm64</LoreRid>
+        <LoreNativeLib Condition="'$(IsOSX)'=='true' And '$(HostArch)'=='Arm64'">liblorelib.dylib</LoreNativeLib>
+
+        <LoreRid Condition="'$(IsLinux)'=='true' And '$(HostArch)'=='X64'">linux-x64</LoreRid>
+        <LoreNativeLib Condition="'$(IsLinux)'=='true' And '$(HostArch)'=='X64'">liblorelib.so</LoreNativeLib>
+
+        <!-- Package name is overridable for custom builds (e.g. LoreVcsPrivate)
+             via the LORE_PACKAGE_NAME env var; defaults to the open-source name.
+             First non-empty wins: -p:LorePackageName override, then env var, then default. -->
+        <LorePackageName Condition="'$(LorePackageName)'==''">$(LORE_PACKAGE_NAME)</LorePackageName>
+        <LorePackageName Condition="'$(LorePackageName)'==''">LoreVcs</LorePackageName>
+        <PackageId>$(LorePackageName).runtime.$(LoreRid)</PackageId>
+    </PropertyGroup>
+
+    <!-- Fail clearly on an unsupported host instead of producing a bad package. -->
+    <Target Name="ValidateLoreHost" BeforeTargets="Build;Pack">
+        <Error Condition="'$(LoreRid)'==''"
+            Text="Unsupported build host (OS/$(HostArch)). LoreVcs.runtime packages must be built on one of: macOS arm64, Linux x64, Windows x64." />
+        <Error Condition="!Exists('../lore/lib/$(LoreNativeLib)')"
+            Text="Native library ../lore/lib/$(LoreNativeLib) not found. Run find_lorelib.py first (it fetches the host's lorelib)." />
+    </Target>
+
+    <ItemGroup>
+        <None Include="../lore/lib/$(LoreNativeLib)" Condition="'$(LoreRid)'!=''"
+            Pack="true" PackagePath="runtimes/$(LoreRid)/native" />
+        <!-- Third-party notices for the native lib (Lore_Licenses.txt,
+             liblore.THIRD-PARTY-NOTICES.txt). Optional: fetched by find_lorelib.py
+             into ../lore/lib when Lore published them; glob => no error if absent. -->
+        <None Include="../lore/lib/*.txt" Condition="'$(LoreRid)'!=''"
+            Pack="true" PackagePath="runtimes/$(LoreRid)/native" />
+        <!-- This package's own license at the package root. -->
+        <None Include="../LICENSE" Pack="true" PackagePath="/" />
+    </ItemGroup>
+
+</Project>

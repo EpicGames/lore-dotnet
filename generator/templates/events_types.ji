@@ -1,0 +1,412 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+namespace LoreVcs.Types.Events;
+
+using System;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+
+using LoreVcs.Types;
+using LoreVcs.Types.Enums;
+
+#pragma warning disable CS9084
+
+{% import "utils.ji" as utils %}
+
+{#
+
+Generate the blittable types for the Event types. These are the types that lorelib will return and we need to process.
+
+For instance, for the `struct lore_auth_url_event_data_t`
+
+    typedef struct lore_auth_url_event_data_t {
+        // Authentication URL
+        struct lore_string_t url;
+    } lore_auth_url_event_data_t;
+
+The result is:
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal unsafe struct lore_auth_url_event_data_t
+    {
+        public lore_string_t url;
+
+        public static LoreAuthUrlEventData ToNative(lore_auth_url_event_data_t input)
+        {
+            return new LoreAuthUrlEventData { Url = lore_string_t.ToNative(input.url) };
+        }
+    }
+
+#}
+{% for struct_name, struct_fields in symbols.events.items() %}
+    {% if struct_name not in hardcoded_blit_classes %}
+        {% set class_name = pascal_case(struct_name.removesuffix("_t")) %}
+        [StructLayout(LayoutKind.Sequential)]
+        internal unsafe struct _{{ class_name }}
+        {
+            {% for field in struct_fields %}
+                {% set field_type = field.0 %}
+                {% set field_name = field.1 %}
+                {% set field_array_size = field.2 %}
+
+                {% if field_array_size != 0 %}
+                    {% set field_type = field_type.removesuffix("_t") + "_array_t" %}
+                {% endif %}
+
+                {% if field_type.endswith("event_data_array_t") %}
+                    {# Prepend "_" for event blittable classes #}
+                    private _{{ pascal_case(field_type.removesuffix("_t")) }} {{ field_name }};
+                {% elif field_type not in blit_types and field_type in cs_map %}
+                    private {{ cs_map[field_type] }} {{ field_name }};
+                {% elif field_type in blit_types %}
+                    private {{ pascal_case(field_type.removesuffix("_t")) }} {{ field_name }};
+                {% else %}
+                    private {{ field_type }} {{ field_name }};
+                {% endif %}
+            {% endfor %}
+
+            {% for field in struct_fields %}
+                {% set field_type = field.0 %}
+                {% set field_name = field.1 %}
+                {% set field_array_size = field.2 %}
+
+                {% if field_array_size != 0 %}
+                    {% set field_type = field_type.removesuffix("_t") + "_array_t" %}
+                {% endif %}
+
+                {% set prop_type = cs_map[field_type] %}
+                {% if field_type in ["lore_hash_t", "lore_context_t", "lore_fragment_t", "lore_address_t", "lore_metadata_t", "lore_partition_t", "lore_branch_id_t", "lore_repository_id_t", "lore_instance_id_t"]
+                    or field_type.endswith("event_data_array_t") %}
+                    {% set prop_type = pascal_case(field_type.removesuffix("_t")) %}
+                {% endif %}
+
+                {% set prop_name = pascal_case(field_name) %}
+
+                {% if field.3 %}
+                    /**
+                    * <summary>
+                    * {{ "\n* ".join(field.3).replace("<", "&lt;").replace(">", "&gt;") }}
+                    * </summary>
+                    */
+                {% endif %}
+                {% if prop_type == "byte" %}
+                    public bool {{ prop_name }} {
+                        get => Convert.ToBoolean({{ field_name }});
+                    }
+                {% else %}
+                    {% if "EventData" in prop_type %}
+                        {% if "EventDataArray" in prop_type %}
+                            {% set prop_type = "ref _" + prop_type %}
+                        {% else %}
+                            {% set prop_type = "ref " + prop_type %}
+                        {% endif %}
+                        {% set field_name = "ref " + field_name %}
+                    {% endif %}
+                    public {{ prop_type }} {{ prop_name }} {
+                        {% if field_type in blit_types and field_type not in ["lore_hash_t", "lore_context_t", "lore_fragment_t", "lore_address_t", "lore_metadata_t", "lore_partition_t", "lore_branch_id_t", "lore_repository_id_t", "lore_instance_id_t"] %}
+                            get => {{ pascal_case(field_type.removesuffix("_t")) }}.ToNative({{ field_name }});
+                        {% else %}
+                            get => {{ field_name }};
+                        {% endif %}
+                    }
+                {% endif %}
+            {% endfor %}
+        }
+
+        public unsafe sealed class {{ class_name }}FFI : IDisposable
+        {
+            private _{{ class_name }}* loreEvent;
+            private bool disposed = false;
+
+            private {{ class_name }}FFI(_{{ class_name }}* input)
+            {
+                loreEvent = input;
+            }
+
+            internal static {{ class_name }}FFI From(_{{ class_name }}* input) => new {{ class_name }}FFI(input);
+
+            private void VerifyPropertyAccess()
+            {
+                if (disposed || loreEvent == null)
+                {
+                    throw new ObjectDisposedException(
+                        "LoreEventFFI can be decoded only inside the event callback handler."
+                    );
+                }
+            }
+
+            {% for field in struct_fields %}
+                {% set field_type = field.0 %}
+                {% set field_name = field.1 %}
+                {% set field_array_size = field.2 %}
+
+                {% if field_array_size != 0 %}
+                    {% set field_type = field_type.removesuffix("_t") + "_array_t" %}
+                {% endif %}
+
+                {% set prop_type = cs_map[field_type] %}
+
+                {% if field_type in ["lore_hash_t", "lore_context_t", "lore_fragment_t", "lore_address_t", "lore_metadata_t", "lore_partition_t", "lore_branch_id_t", "lore_repository_id_t", "lore_instance_id_t"] %}
+                    {% set prop_type = pascal_case(field_type.removesuffix("_t")) %}
+                {% endif %}
+
+                {% if field_type.endswith("event_data_array_t") %}
+                    {% set prop_type = "_" + pascal_case(field_type.removesuffix("_t")) %}
+                {% endif %}
+
+                {% if "EventData" in prop_type %}
+                    {% set return_type = prop_type.removeprefix("_") + "FFI" %}
+                    public {{ return_type }} {{ pascal_case(field_name) }} {
+                        get {
+                            VerifyPropertyAccess();
+                            fixed({{ prop_type }}* ptr = &loreEvent->{{ pascal_case(field_name) }})
+                            {
+                                return {{ return_type }}.From(ptr);
+                            }
+                        }
+                    }
+                {% else %}
+                    {% if prop_type == "byte" %}
+                        public bool {{ pascal_case(field_name) }} {
+                    {% else %}
+                        public {{ prop_type }} {{ pascal_case(field_name) }} {
+                    {% endif %}
+                        get {
+                            VerifyPropertyAccess();
+                            return loreEvent->{{ pascal_case(field_name) }};
+                        }
+                    }
+                {% endif %}
+            {% endfor %}
+
+            public {{ class_name }} Clone()
+            {
+                VerifyPropertyAccess();
+                return new {{ class_name }}
+                {
+                    {% for field in struct_fields %}
+                        {% set field_type = field.0 %}
+                        {% set field_name = field.1 %}
+                        {% set field_array_size = field.2 %}
+
+                        {% if field_array_size != 0 %}
+                            {% set field_type = field_type.removesuffix("_t") + "_array_t" %}
+                        {% endif %}
+
+                        {% if field_type in ["lore_hash_t", "lore_context_t", "lore_partition_t", "lore_branch_id_t", "lore_repository_id_t", "lore_instance_id_t"] %}
+                            {{ pascal_case(field_name) }} = {{ pascal_case(field_name) }}.Data,
+                        {% elif field_type in ["lore_metadata_t", "lore_address_t", "lore_fragment_t"]
+                            or field_type.endswith(("event_data_t", "event_data_array_t")) %}
+                            {{ pascal_case(field_name) }} = {{ pascal_case(field_name) }}.Clone(),
+                        {% else %}
+                            {{ pascal_case(field_name) }} = {{ pascal_case(field_name) }},
+                        {% endif %}
+                    {% endfor %}
+                };
+            }
+
+            public void Dispose()
+            {
+                disposed = true;
+            }
+        }
+
+        public sealed class {{ class_name }} : LoreEvent
+        {
+            {% for field in struct_fields %}
+                {% set field_type = field.0 %}
+                {% set field_name = field.1 %}
+                {% set field_array_size = field.2 %}
+
+                {% if field_array_size != 0 %}
+                    {% set field_type = field_type.removesuffix("_t") + "_array_t" %}
+                {% endif %}
+
+                {% set prop_type = cs_map[field_type] %}
+                {% if "EventData" in prop_type %}
+                    {% set prop_type = prop_type.removeprefix("_") %}
+                {% endif %}
+
+                {% if prop_type == "byte" %}
+                    public bool {{ pascal_case(field_name) }} { get; set; }
+                {% else %}
+                    public {{ prop_type }} {{ pascal_case(field_name) }} { get; set; }
+                {% endif %}
+
+                {% if prop_type in init_map %}
+                    = {{ init_map[prop_type] }};
+                {% endif %}
+            {% endfor %}
+
+            {% set tag = struct_name.removeprefix("lore_").removesuffix("_event_data_t") %}
+            public {{ class_name }}() : base(LoreEventTag.{{ tag.upper() }}) {}
+        }
+    {% endif %}
+{% endfor %}
+
+[StructLayout(LayoutKind.Explicit)]
+internal unsafe struct _LoreEvent
+{
+    [FieldOffset(0)] private LoreEventTag tag;
+    {% for field in symbols.types["lore_event_t"] %}
+        {% set field_type = field.0 %}
+        {% set field_name = field.1 %}
+
+        [FieldOffset(8)] private _{{ pascal_case(field_type.removesuffix("_t")) }} {{ field_name }};
+    {% endfor %}
+
+    public LoreEventTag Tag {
+        get => tag;
+    }
+
+    {% for value in symbols.enums["lore_event_tag_t"] %}
+        {% set type = pascal_case("lore_" + value.lower() + "_event_data") %}
+        {% set name = pascal_case(value) %}
+        public {{ type }}FFI {{ name}} {
+            get {
+                fixed(_{{ type }}* ptr = &{{ value.lower() }})
+                {
+                    return {{ type }}FFI.From(ptr);
+                }
+            }
+        }
+    {% endfor %}
+}
+
+{% for arr in event_array_types %}
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct _{{ arr.array_class }}
+{
+    public IntPtr {{ arr.ptr_field }};
+    public nuint {{ arr.count_field }};
+}
+
+public unsafe sealed class {{ arr.array_class }}FFI : IDisposable
+{
+    private _{{ arr.array_class }}* loreEvent;
+    private bool disposed = false;
+
+    private {{ arr.array_class }}FFI(_{{ arr.array_class }}* input)
+    {
+        loreEvent = input;
+    }
+
+    internal static {{ arr.array_class }}FFI From(_{{ arr.array_class }}* input) => new {{ arr.array_class }}FFI(input);
+
+    private void VerifyPropertyAccess()
+    {
+        if (disposed || loreEvent == null)
+        {
+            throw new ObjectDisposedException(
+                "LoreEventFFI can be decoded only inside the event callback handler."
+            );
+        }
+    }
+
+    public {{ arr.element_class }}[] Clone()
+    {
+        VerifyPropertyAccess();
+        if (loreEvent->{{ arr.ptr_field }} == IntPtr.Zero) return Array.Empty<{{ arr.element_class }}>();
+        if (loreEvent->{{ arr.count_field }} == 0) return Array.Empty<{{ arr.element_class }}>();
+
+        var buffer_view = new ReadOnlySpan<_{{ arr.element_class }}>((void*)loreEvent->{{ arr.ptr_field }}, (int)loreEvent->{{ arr.count_field }});
+
+        var events = new {{ arr.element_class }}[buffer_view.Length];
+        for (int i = 0; i < buffer_view.Length; ++i)
+        {
+            fixed (_{{ arr.element_class }}* ptr = &buffer_view[i])
+            {
+                events[i] = {{ arr.element_class }}FFI.From(ptr).Clone();
+            }
+        }
+        return events;
+    }
+
+    public void Dispose()
+    {
+        disposed = true;
+    }
+}
+{% endfor %}
+
+{#
+
+Wrapper class for a Lore event.
+This class is non-owning and the data is only valid during the callback.
+
+#}
+public unsafe sealed class LoreEventFFI : IDisposable
+{
+    private _LoreEvent* loreEvent;
+    private bool disposed = false;
+
+    private LoreEventFFI(_LoreEvent* input){
+        loreEvent = input;
+    }
+
+    internal static LoreEventFFI From(_LoreEvent* input) => new LoreEventFFI(input);
+
+    private void VerifyPropertyAccess(){
+        if (disposed){
+            throw new ObjectDisposedException("LoreEventFFI can be decoded only inside the event callback handler.");
+        }
+    }
+
+    public LoreEventTag Tag
+    {
+        get
+        {
+            VerifyPropertyAccess();
+            return loreEvent->Tag;
+        }
+    }
+
+    public T GetData<T>()
+    {
+        VerifyPropertyAccess();
+
+        {% for value in symbols.enums["lore_event_tag_t"] %}
+            {% set T = pascal_case("lore_" + value.lower() + "_event_data") %}
+            {% set type = pascal_case(value) %}
+            if (typeof(T) == typeof({{ T }}FFI) && Tag == LoreEventTag.{{ value.upper() }})
+            {
+                return (T)(object)loreEvent->{{ type }};
+            }
+        {% endfor %}
+
+        throw new InvalidOperationException($"Type {typeof(T).Name} does not match this event's tag.");
+    }
+
+    public LoreEvent Clone()
+    {
+        VerifyPropertyAccess();
+
+        {% for value in symbols.enums["lore_event_tag_t"] %}
+            {% set T = pascal_case("lore_" + value.lower() + "_event_data") %}
+            {% set type = pascal_case(value) %}
+            if (Tag == LoreEventTag.{{ value.upper() }})
+            {
+                return GetData<{{ T }}FFI>().Clone();
+            }
+        {% endfor %}
+
+        throw new InvalidOperationException($"Unable to clone event, unknown tag {Tag}.");
+    }
+
+    public void Dispose()
+    {
+        disposed = true;
+    }
+}
+
+public abstract class LoreEvent
+{
+    public LoreEventTag Tag { get; }
+
+    protected LoreEvent(LoreEventTag tag)
+    {
+        Tag = tag;
+    }
+}
+
+#pragma warning restore CS9084

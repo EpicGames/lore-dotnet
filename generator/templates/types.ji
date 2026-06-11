@@ -1,0 +1,797 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+namespace LoreVcs.Types;
+
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
+using LoreVcs.Types.Enums;
+using LoreVcs.Types.Events;
+
+{% import "utils.ji" as utils %}
+
+{#
+
+LoreCallback represents the delegate that already Marshalled the payload into
+the corresponding event. This provides the user with the friendlier C# API.
+
+#}
+
+public delegate void LoreCallback(LoreEventFFI loreEvent, ulong userContext);
+
+{#
+
+LoreInternalCallback is the internal representation of the lorelib expected callback.
+It has all the information provided by lorelib and will internally call the user-provided
+callback after Marshalling the payload.
+
+#}
+
+[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+internal unsafe delegate void LoreInternalCallback(_LoreEvent* loreEvent, ulong userContext);
+
+{#
+
+Generate blittable types for foundational types, this are the types that we need to ultimately generate in order to make a call to lorelib.
+The blittable types are also in charge of disposing any unamanged resources and/or creating a managed C# type from it.
+Default access is internal as the blittable types should be only used from within the SDK. Only exception being the IsSet types.
+
+For instance, for the `struct LoreString`
+
+    typedef struct LoreString {
+        const char *string;
+        uintptr_t length;
+    } LoreString;
+
+the result is:
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal unsafe struct LoreString : IDisposable
+    {
+        public IntPtr string_;
+        public nuint length;
+
+        public static LoreString ToBlittable(string input)
+        {
+            input = input ?? string.Empty;
+            byte[] input_encoded = Encoding.UTF8.GetBytes(input);
+            IntPtr buffer = Marshal.AllocHGlobal(input_encoded.Length);
+            Marshal.Copy(input_encoded, 0, buffer, input_encoded.Length);
+            return new LoreString { string_ = buffer, length = (nuint)input_encoded.Length };
+        }
+
+        public void Dispose()
+        {
+            if (string_ != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(string_);
+                string_ = IntPtr.Zero;
+                length = 0;
+            }
+        }
+
+        public static string FromBlittable(LoreString input)
+        {
+            if (input.string_ == IntPtr.Zero)
+                return string.Empty;
+            if (input.length == 0)
+                return string.Empty;
+
+            var buffer_view = new ReadOnlySpan<byte>((void*)input.string_, (int)input.length);
+            return Encoding.UTF8.GetString(buffer_view);
+        }
+    }
+
+#}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct LoreHash : IDisposable
+{
+    private const int dataSize = 32;
+    private fixed byte data[dataSize];
+
+    public LoreHash(byte[] input)
+    {
+        if (input == null)
+        {
+            Console.WriteLine("Input is null. Returning default.");
+            return;
+        }
+
+        fixed(byte* src = input)
+        fixed (byte* dst = data)
+        {
+            if (input.Length > dataSize)
+            {
+                Console.WriteLine("Input length bigger than expected. Truncating.");
+                Buffer.MemoryCopy(src, dst, dataSize, dataSize);
+                return;
+            }
+
+            if (input.Length < dataSize)
+            {
+                Console.WriteLine("Input length smaller than expected. Padding with default.");
+            }
+            Buffer.MemoryCopy(src, dst, dataSize, input.Length);
+        }
+    }
+
+    public static implicit operator LoreHash(byte[] input)
+    {
+        return new LoreHash(input);
+    }
+
+    public byte[] Data {
+        get {
+            fixed(byte* buffer = data)
+            {
+                var buffer_view = new ReadOnlySpan<byte>(buffer, dataSize);
+                return buffer_view.ToArray();
+            }
+        }
+    }
+
+    public void Dispose() {}
+}
+
+[InlineArray(2)]
+public unsafe struct LoreHashArray : IDisposable
+{
+    public LoreHash parent0;
+
+    public LoreHashArray(byte[][] input)
+    {
+        if (input != null && input.Length > 0) this[0] = new LoreHash(input[0]);
+        if (input != null && input.Length > 1) this[1] = new LoreHash(input[1]);
+    }
+
+    public static implicit operator LoreHashArray(byte[][] input)
+    {
+        return new LoreHashArray(input);
+    }
+
+    public static byte[][] ToNative(LoreHashArray input)
+    {
+        var parent = new byte[2][];
+        parent[0] = input[0].Data;
+        parent[1] = input[1].Data;
+        return parent;
+    }
+
+    public void Dispose() {}
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct LoreContext : IDisposable
+{
+    public const int dataSize = 16;
+    public fixed byte data[dataSize];
+
+    public LoreContext(byte[] input)
+    {
+        if (input == null)
+        {
+            Console.WriteLine("Input is null. Returning default.");
+            return;
+        }
+
+        fixed(byte* src = input)
+        fixed (byte* dst = data)
+        {
+            if (input.Length > dataSize)
+            {
+                Console.WriteLine("Input length bigger than expected. Truncating.");
+                Buffer.MemoryCopy(src, dst, dataSize, dataSize);
+                return;
+            }
+
+            if (input.Length < dataSize)
+            {
+                Console.WriteLine("Input length smaller than expected. Padding with default.");
+            }
+            Buffer.MemoryCopy(src, dst, dataSize, input.Length);
+        }
+    }
+
+    public static implicit operator LoreContext(byte[] input)
+    {
+        return new LoreContext(input);
+    }
+
+    public byte[] Data {
+        get {
+            fixed(byte* buffer = data)
+            {
+                var buffer_view = new ReadOnlySpan<byte>(buffer, dataSize);
+                return buffer_view.ToArray();
+            }
+        }
+    }
+
+    public void Dispose() {}
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct LorePartition : IDisposable
+{
+    public const int dataSize = 16;
+    public fixed byte data[dataSize];
+
+    public LorePartition(byte[] input)
+    {
+        if (input == null)
+        {
+            Console.WriteLine("Input is null. Returning default.");
+            return;
+        }
+
+        fixed(byte* src = input)
+        fixed (byte* dst = data)
+        {
+            if (input.Length > dataSize)
+            {
+                Console.WriteLine("Input length bigger than expected. Truncating.");
+                Buffer.MemoryCopy(src, dst, dataSize, dataSize);
+                return;
+            }
+
+            if (input.Length < dataSize)
+            {
+                Console.WriteLine("Input length smaller than expected. Padding with default.");
+            }
+            Buffer.MemoryCopy(src, dst, dataSize, input.Length);
+        }
+    }
+
+    public static implicit operator LorePartition(byte[] input)
+    {
+        return new LorePartition(input);
+    }
+
+    public byte[] Data {
+        get {
+            fixed(byte* buffer = data)
+            {
+                var buffer_view = new ReadOnlySpan<byte>(buffer, dataSize);
+                return buffer_view.ToArray();
+            }
+        }
+    }
+
+    public void Dispose() {}
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct LoreBranchId : IDisposable
+{
+    public const int dataSize = 16;
+    public fixed byte data[dataSize];
+
+    public LoreBranchId(byte[] input)
+    {
+        if (input == null)
+        {
+            Console.WriteLine("Input is null. Returning default.");
+            return;
+        }
+
+        fixed(byte* src = input)
+        fixed (byte* dst = data)
+        {
+            if (input.Length > dataSize)
+            {
+                Console.WriteLine("Input length bigger than expected. Truncating.");
+                Buffer.MemoryCopy(src, dst, dataSize, dataSize);
+                return;
+            }
+
+            if (input.Length < dataSize)
+            {
+                Console.WriteLine("Input length smaller than expected. Padding with default.");
+            }
+            Buffer.MemoryCopy(src, dst, dataSize, input.Length);
+        }
+    }
+
+    public static implicit operator LoreBranchId(byte[] input)
+    {
+        return new LoreBranchId(input);
+    }
+
+    public byte[] Data {
+        get {
+            fixed(byte* buffer = data)
+            {
+                var buffer_view = new ReadOnlySpan<byte>(buffer, dataSize);
+                return buffer_view.ToArray();
+            }
+        }
+    }
+
+    public void Dispose() {}
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct LoreRepositoryId : IDisposable
+{
+    public const int dataSize = 16;
+    public fixed byte data[dataSize];
+
+    public LoreRepositoryId(byte[] input)
+    {
+        if (input == null)
+        {
+            Console.WriteLine("Input is null. Returning default.");
+            return;
+        }
+
+        fixed(byte* src = input)
+        fixed (byte* dst = data)
+        {
+            if (input.Length > dataSize)
+            {
+                Console.WriteLine("Input length bigger than expected. Truncating.");
+                Buffer.MemoryCopy(src, dst, dataSize, dataSize);
+                return;
+            }
+
+            if (input.Length < dataSize)
+            {
+                Console.WriteLine("Input length smaller than expected. Padding with default.");
+            }
+            Buffer.MemoryCopy(src, dst, dataSize, input.Length);
+        }
+    }
+
+    public static implicit operator LoreRepositoryId(byte[] input)
+    {
+        return new LoreRepositoryId(input);
+    }
+
+    public byte[] Data {
+        get {
+            fixed(byte* buffer = data)
+            {
+                var buffer_view = new ReadOnlySpan<byte>(buffer, dataSize);
+                return buffer_view.ToArray();
+            }
+        }
+    }
+
+    public void Dispose() {}
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct LoreInstanceId : IDisposable
+{
+    public const int dataSize = 16;
+    public fixed byte data[dataSize];
+
+    public LoreInstanceId(byte[] input)
+    {
+        if (input == null)
+        {
+            Console.WriteLine("Input is null. Returning default.");
+            return;
+        }
+
+        fixed(byte* src = input)
+        fixed (byte* dst = data)
+        {
+            if (input.Length > dataSize)
+            {
+                Console.WriteLine("Input length bigger than expected. Truncating.");
+                Buffer.MemoryCopy(src, dst, dataSize, dataSize);
+                return;
+            }
+
+            if (input.Length < dataSize)
+            {
+                Console.WriteLine("Input length smaller than expected. Padding with default.");
+            }
+            Buffer.MemoryCopy(src, dst, dataSize, input.Length);
+        }
+    }
+
+    public static implicit operator LoreInstanceId(byte[] input)
+    {
+        return new LoreInstanceId(input);
+    }
+
+    public byte[] Data {
+        get {
+            fixed(byte* buffer = data)
+            {
+                var buffer_view = new ReadOnlySpan<byte>(buffer, dataSize);
+                return buffer_view.ToArray();
+            }
+        }
+    }
+
+    public void Dispose() {}
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct LoreString : IDisposable
+{
+    IntPtr string_;
+    nuint length;
+
+    public LoreString(string input)
+    {
+        input = input ?? string.Empty;
+        byte[] input_encoded = Encoding.UTF8.GetBytes(input);
+        string_ = Marshal.AllocHGlobal(input_encoded.Length);
+        Marshal.Copy(input_encoded, 0, string_, input_encoded.Length);
+        length = (nuint)input_encoded.Length;
+    }
+
+    public static implicit operator LoreString(string input)
+    {
+        return new LoreString(input);
+    }
+
+    public static string ToNative(LoreString input)
+    {
+        if (input.string_ == IntPtr.Zero) return string.Empty;
+        if (input.length == 0) return string.Empty;
+
+        var buffer_view = new ReadOnlySpan<byte>((void*)input.string_, (int)input.length);
+        return Encoding.UTF8.GetString(buffer_view);
+    }
+
+    public void Dispose()
+    {
+        if (string_ != IntPtr.Zero)
+        {
+            Marshal.FreeHGlobal(string_);
+            string_ = IntPtr.Zero;
+            length = 0;
+        }
+    }
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct LoreBinary : IDisposable
+{
+    IntPtr payload;
+    nuint length;
+
+    public LoreBinary(byte[] input)
+    {
+        input = input ?? Array.Empty<byte>();
+        payload = Marshal.AllocHGlobal(input.Length);
+        Marshal.Copy(input, 0, payload, input.Length);
+        length = (nuint)input.Length;
+    }
+
+    public static byte[] ToNative(LoreBinary input)
+    {
+        if (input.payload == IntPtr.Zero) return Array.Empty<byte>();
+        if (input.length == 0) return Array.Empty<byte>();
+
+        var buffer_view = new ReadOnlySpan<byte>((void*)input.payload, (int)input.length);
+        return buffer_view.ToArray();
+    }
+
+    public void Dispose()
+    {
+        if (payload != IntPtr.Zero)
+        {
+            Marshal.FreeHGlobal(payload);
+            payload = IntPtr.Zero;
+            length = 0;
+        }
+    }
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct LoreStore : IDisposable
+{
+    private ulong handle_id;
+
+    public LoreStore(ulong input)
+    {
+        handle_id = input;
+    }
+
+    public static implicit operator LoreStore(ulong input)
+    {
+        return new LoreStore(input);
+    }
+
+    public ulong HandleId
+    {
+        get => handle_id;
+    }
+
+    public static readonly LoreStore Invalid = default;
+
+    public void Dispose() {}
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct LoreBytes : IDisposable
+{
+    IntPtr ptr;
+    nuint len;
+
+    public LoreBytes(byte[] input)
+    {
+        input = input ?? Array.Empty<byte>();
+        ptr = Marshal.AllocHGlobal(input.Length);
+        Marshal.Copy(input, 0, ptr, input.Length);
+        len = (nuint)input.Length;
+    }
+
+    public static implicit operator LoreBytes(byte[] input)
+    {
+        return new LoreBytes(input);
+    }
+
+    public static byte[] ToNative(LoreBytes input)
+    {
+        if (input.ptr == IntPtr.Zero) return Array.Empty<byte>();
+        if (input.len == 0) return Array.Empty<byte>();
+
+        var buffer_view = new ReadOnlySpan<byte>((void*)input.ptr, (int)input.len);
+        return buffer_view.ToArray();
+    }
+
+    public void Dispose()
+    {
+        if (ptr != IntPtr.Zero)
+        {
+            Marshal.FreeHGlobal(ptr);
+            ptr = IntPtr.Zero;
+            len = 0;
+        }
+    }
+}
+
+{% for arr in array_types %}
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct {{ arr.array_class }} : IDisposable
+{
+    IntPtr {{ arr.ptr_field }};
+    nuint {{ arr.count_field }};
+
+    public {{ arr.array_class }}({{ arr.element_cs_type }}[] input)
+    {
+        input = input ?? Array.Empty<{{ arr.element_cs_type }}>();
+        nint element_size = Marshal.SizeOf<{{ arr.marshal_size_type }}>();
+        {{ arr.ptr_field }} = Marshal.AllocHGlobal(element_size * input.Length);
+        var buffer_view = new Span<{{ arr.element_class }}>((void*){{ arr.ptr_field }}, input.Length);
+        for (int i = 0; i < input.Length; ++i)
+{% if arr.category == "primitive_bool" %}
+            buffer_view[i] = input[i] ? (byte)1 : (byte)0;
+{% elif arr.category == "native_wrapper" %}
+            buffer_view[i] = new {{ arr.element_class }}(input[i]);
+{% else %}
+            buffer_view[i] = input[i];
+{% endif %}
+        {{ arr.count_field }} = (nuint)input.Length;
+    }
+
+    public static implicit operator {{ arr.array_class }}({{ arr.element_cs_type }}[] input)
+    {
+        return new {{ arr.array_class }}(input);
+    }
+
+    public static {{ arr.element_cs_type }}[] ToNative({{ arr.array_class }} input)
+    {
+        if (input.{{ arr.ptr_field }} == IntPtr.Zero) return Array.Empty<{{ arr.element_cs_type }}>();
+        if (input.{{ arr.count_field }} == 0) return Array.Empty<{{ arr.element_cs_type }}>();
+
+        var buffer_view = new ReadOnlySpan<{{ arr.element_class }}>((void*)input.{{ arr.ptr_field }}, (int)input.{{ arr.count_field }});
+{% if arr.category == "primitive_bool" %}
+        var result = new bool[buffer_view.Length];
+        for (int i = 0; i < buffer_view.Length; ++i)
+            result[i] = buffer_view[i] != 0;
+        return result;
+{% elif arr.category == "native_wrapper" %}
+        var result = new {{ arr.element_cs_type_base }}[buffer_view.Length]{{ arr.element_cs_type_rank }};
+        for (int i = 0; i < buffer_view.Length; ++i)
+            result[i] = {{ arr.to_native_call | replace("{element}", "buffer_view[i]") }};
+        return result;
+{% else %}
+        return buffer_view.ToArray();
+{% endif %}
+    }
+
+    public void Dispose()
+    {
+        if ({{ arr.ptr_field }} != IntPtr.Zero)
+        {
+{% if arr.category == "native_wrapper" or arr.category == "struct" %}
+            var buffer_view = new Span<{{ arr.element_class }}>((void*){{ arr.ptr_field }}, (int){{ arr.count_field }});
+            for (int i = 0; i < buffer_view.Length; ++i)
+                buffer_view[i].Dispose();
+
+{% endif %}
+            Marshal.FreeHGlobal({{ arr.ptr_field }});
+            {{ arr.ptr_field }} = IntPtr.Zero;
+            {{ arr.count_field }} = 0;
+        }
+    }
+}
+
+{% endfor %}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct _LoreEventCallbackConfig
+{
+    public ulong userContext;
+    public LoreInternalCallback func;
+}
+
+public class LoreEventCallbackConfig{
+    public ulong UserContext { get; set; }
+    public LoreCallback Func { get; set; } = (LoreEventFFI loreEvent, ulong userContext) => {};
+}
+
+{% for struct_name, struct_fields in symbols.types.items() %}
+    {% set class_name = pascal_case(struct_name.removesuffix("_t")) %}
+    {% if struct_name not in hardcoded_blit_classes %}
+        [StructLayout(LayoutKind.Sequential)]
+        public unsafe struct {{ class_name }} : IDisposable
+        {
+            {% for field in struct_fields %}
+                {% set field_type = field.0 %}
+                {% set field_name = field.1.replace("string", "string_") %}
+                {% set field_array_size = field.2 %}
+
+                {% if field_array_size != 0 %}
+                    {% set field_type = field_type.removesuffix("_t") + "_array_t" %}
+                {% endif %}
+
+                {% if field_type not in blit_types and field_type in cs_map %}
+                    {% set field_type = cs_map[field_type] %}
+                {% endif %}
+
+                {% if field_type in utils.cs_allowed_fixed and field_array_size != 0 %}
+                    private const uint {{ field_name }}Size = {{ field_array_size }};
+                    private fixed {{ field_type }} {{ field_name }}[{{ field_array_size }}];
+                {% elif field_type in blit_types %}
+                    private {{ pascal_case(field_type.removesuffix("_t")) }} {{ field_name }};
+                {% else %}
+                    private {{ field_type }} {{ field_name }};
+                {% endif %}
+            {% endfor %}
+
+            {% for field in struct_fields %}
+                {% set field_type = field.0 %}
+                {% set field_name = field.1 %}
+                {% set field_array_size = field.2 %}
+
+                {% if field_array_size != 0 %}
+                    {% set field_type = field_type.removesuffix("_t") + "_array_t" %}
+                {% endif %}
+
+                {% set prop_type = cs_map[field_type] %}
+                {% if field_type in ["lore_hash_t", "lore_context_t", "lore_branch_point_t", "lore_partition_t", "lore_branch_id_t", "lore_repository_id_t", "lore_instance_id_t"] %}
+                    {% set prop_type = pascal_case(field_type.removesuffix("_t")) %}
+                {% endif %}
+
+                {% if field.3 %}
+                    /**
+                    * <summary>
+                    * {{ "\n* ".join(field.3).replace("<", "&lt;").replace(">", "&gt;") }}
+                    * </summary>
+                    */
+                {% endif %}
+                {% if prop_type == "byte" %}
+                    public bool {{ pascal_case(field_name) }} {
+                        set => {{ field_name }} = Convert.ToByte(value);
+                        get => Convert.ToBoolean({{ field_name }});
+                    }
+                {% else %}
+                    public {{ prop_type }} {{ pascal_case(field_name) }} {
+                        {% if field_type in blit_types and field_type not in ["lore_hash_t", "lore_context_t", "lore_branch_point_t", "lore_partition_t", "lore_branch_id_t", "lore_repository_id_t", "lore_instance_id_t", "lore_address_t", "lore_fragment_t", "lore_metadata_t"] %}
+                            set {
+                                {{ field_name }}.Dispose();
+                                {{ field_name }} = value;
+                            }
+                            get => {{ pascal_case(field_type.removesuffix("_t")) }}.ToNative({{ field_name }});
+                        {% else %}
+                            set => {{ field_name }} = value;
+                            get => {{ field_name }};
+                        {% endif %}
+                    }
+                {% endif %}
+            {% endfor %}
+
+            public {{ class_name }} Clone() => this;
+
+            public void Dispose()
+            {
+                {% for field in struct_fields %}
+                    {% set field_type = field.0 %}
+                    {% set field_name = field.1 %}
+                    {% set field_array_size = field.2 %}
+                    {% if field_array_size != 0 %}
+                        {% set field_type = field_type.removesuffix("_t") + "_array_t" %}
+                    {% endif %}
+                    {% if field_type in blit_types %}
+                        {{ field_name }}.Dispose();
+                    {% endif %}
+                {% endfor %}
+            }
+        }
+    {% endif %}
+{% endfor %}
+
+[StructLayout(LayoutKind.Explicit)]
+public struct LoreMetadata
+{
+    [FieldOffset(0)] private LoreMetadataTag tag;
+    {% for field in symbols.types["lore_metadata_t"] %}
+        {% set field_type = field.0 %}
+        {% set field_name = field.1.replace("string", "string_") %}
+
+        {% if field_type not in blit_types and field_type in cs_map %}
+            [FieldOffset(8)] private {{ cs_map[field_type] }} {{ field_name }};
+        {% elif field_type in blit_types %}
+            [FieldOffset(8)] private {{ pascal_case(field_type.removesuffix("_t")) }} {{ field_name }};
+        {% else %}
+            [FieldOffset(8)] private {{ field_type }} {{ field_name }};
+        {% endif %}
+    {% endfor %}
+
+    public LoreMetadataTag Tag
+    {
+        get => tag;
+    }
+
+    public LoreAddress Address
+    {
+        get => address;
+    }
+    public bool Boolean
+    {
+        get => Convert.ToBoolean(boolean);
+    }
+    public byte[] Binary
+    {
+        get => LoreBinary.ToNative(binary);
+    }
+    public LoreContext Context
+    {
+        get => context;
+    }
+    public LoreHash Hash
+    {
+        get => hash;
+    }
+    public ulong Numeric
+    {
+        get => numeric;
+    }
+    public string String
+    {
+        get => LoreString.ToNative(string_);
+    }
+
+    public LoreMetadata Clone()
+    {
+        var result = this;
+
+        // Deep-copy variants that hold unmanaged pointers (IntPtr)
+        switch (tag)
+        {
+            case LoreMetadataTag.BINARY:
+                Unsafe.As<ulong, LoreBinary>(
+                    ref Unsafe.Add(ref Unsafe.As<LoreMetadata, ulong>(ref result), 1)
+                ) = new LoreBinary(LoreBinary.ToNative(binary));
+                break;
+            case LoreMetadataTag.STRING:
+                Unsafe.As<ulong, LoreString>(
+                    ref Unsafe.Add(ref Unsafe.As<LoreMetadata, ulong>(ref result), 1)
+                ) = new LoreString(LoreString.ToNative(string_));
+                break;
+        }
+
+        return result;
+    }
+}

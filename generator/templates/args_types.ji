@@ -1,0 +1,121 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+// This file is generated, do not modify it here, it may be overwritten
+
+namespace LoreVcs.Types.Args;
+
+using System;
+using System.Runtime.InteropServices;
+
+using LoreVcs.Types;
+using LoreVcs.Types.Enums;
+
+{% import "utils.ji" as utils %}
+
+{#
+Generate blittable types for Args types, this are the types that we need to ultimately generate in order to make a call to lorelib.
+The blittable types are also in charge of disposing any unamanged resources.
+Default access is internal as the blittable types should be only used from within the SDK. Only exception being the ArgsIsSet types.
+
+For instance, for the `struct lore_auth_user_info_args_t`
+
+    typedef struct lore_auth_user_info_args_t {
+    // Path to the repository
+    struct lore_string_t repository_path;
+    // An array of user ids
+    struct lore_string_array_t ids;
+    } lore_auth_user_info_args_t;
+
+the result is:
+
+    [StructLayout(LayoutKind.Sequential)]
+    public unsafe struct LoreAuthUserInfoArgs : IDisposable
+    {
+        private lore_string_t repository_path;
+
+        private lore_string_array_t ids;
+
+        public lore_string_t RepositoryPath
+        {
+            set => repository_path = value;
+        }
+
+        public lore_string_array_t Ids
+        {
+            set => ids = value;
+        }
+
+        public void Dispose()
+        {
+            repository_path.Dispose();
+            ids.Dispose();
+        }
+    }
+
+#}
+{% for struct_name, struct_fields in symbols.args.items() %}
+    {% set class_name = pascal_case(struct_name.removesuffix("_t")) %}
+    [StructLayout(LayoutKind.Sequential)]
+    public unsafe struct {{ class_name }} : IDisposable
+    {
+        {% for field in struct_fields %}
+            {% set field_type = field.0 %}
+            {% set field_name = field.1 %}
+
+            {% if field_type not in blit_types and field_type in cs_map %}
+                private {{ cs_map[field_type] }} {{ utils.escape_reserved_word(field_name) }};
+            {% elif field_type in blit_types %}
+                private {{ pascal_case(field_type.removesuffix("_t")) }} {{ utils.escape_reserved_word(field_name) }};
+            {% else %}
+                private {{ field_type }} {{ utils.escape_reserved_word(field_name) }};
+            {% endif %}
+        {% endfor %}
+
+        {% for field in struct_fields %}
+            {% set field_type = field.0 %}
+            {% set field_name = field.1 %}
+
+            {% set prop_type = cs_map[field_type] %}
+            {% if field_type in ["lore_hash_t", "lore_context_t", "lore_partition_t", "lore_branch_id_t", "lore_repository_id_t"] %}
+                {% set prop_type = pascal_case(field_type.removesuffix("_t")) %}
+            {% endif %}
+
+            {% if field.3 %}
+                /**
+                * <summary>
+                * {{ "\n* ".join(field.3).replace("<", "&lt;").replace(">", "&gt;") }}
+                * </summary>
+                */
+            {% endif %}
+            {% if prop_type == "byte" %}
+                public bool {{ pascal_case(field_name) }} {
+                    set => {{ utils.escape_reserved_word(field_name) }} = Convert.ToByte(value);
+                    get => Convert.ToBoolean({{ utils.escape_reserved_word(field_name) }});
+                }
+            {% else %}
+                public {{ prop_type }} {{ pascal_case(field_name) }} {
+                    {% if field_type in blit_types and field_type not in ["lore_hash_t", "lore_context_t", "lore_branch_point_t", "lore_partition_t", "lore_branch_id_t", "lore_repository_id_t", "lore_instance_id_t", "lore_address_t", "lore_fragment_t", "lore_metadata_t"] %}
+                        set {
+                            {{ utils.escape_reserved_word(field_name) }}.Dispose();
+                            {{ utils.escape_reserved_word(field_name) }} = value;
+                        }
+                        get => {{ pascal_case(field_type.removesuffix("_t")) }}.ToNative({{ utils.escape_reserved_word(field_name) }});
+                    {% else %}
+                        set => {{ utils.escape_reserved_word(field_name) }} = value;
+                        get => {{ utils.escape_reserved_word(field_name) }};
+                    {% endif %}
+                }
+            {% endif %}
+        {% endfor %}
+
+        public void Dispose()
+        {
+            {% for field in struct_fields %}
+                {% set field_type = field.0 %}
+                {% set field_name = field.1 %}
+                {% if field_type in blit_types %}
+                    {{ utils.escape_reserved_word(field_name) }}.Dispose();
+                {% endif %}
+            {% endfor %}
+        }
+    }
+{% endfor %}

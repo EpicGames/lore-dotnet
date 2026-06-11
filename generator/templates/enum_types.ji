@@ -1,0 +1,32 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+namespace LoreVcs.Types.Enums;
+
+{#
+
+Creates a C# enum from the C enum
+
+For instance, for the `enum lore_branch_location_t`
+
+typedef enum lore_branch_location_t {
+  LORE_BRANCH_LOCATION_LOCAL = 0,
+  LORE_BRANCH_LOCATION_REMOTE = 1,
+} lore_branch_location_t;
+
+the result is:
+
+public enum LoreBranchLocation : uint
+{
+    LOCAL = 0,
+    REMOTE = 1,
+}
+#}
+
+{% for enum_name, enum_values in symbols.enums.items() %}
+public enum {{pascal_case(enum_name.removesuffix("_t"))}} : uint
+{
+    {% for value in enum_values %}
+        {{value}} = {{loop.index - 1}},
+    {% endfor %}
+}
+{% endfor %}

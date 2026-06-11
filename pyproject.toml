@@ -1,0 +1,11 @@
+[project]
+name = "lore-cs"
+version = "0.0.1"
+
+[dependency-groups]
+dev = [
+    "pycparser",
+    "jinja2",
+    "pytest",
+    "uv"
+]
