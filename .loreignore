@@ -1,0 +1,16 @@
+**/.venv/
+**/ffi/
+**/generated/
+**/lore/
+**/bin/
+**/Release/
+**/Debug/
+**/__pycache__/
+**/obj/
+LoreVcs/
+!LoreVcs/LoreVcs.csproj
+*.sln
+**/LoreRepositories/
+**/.config/
+**/uv.lock
+.vscode
