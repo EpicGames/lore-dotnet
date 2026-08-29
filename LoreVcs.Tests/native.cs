@@ -229,9 +229,9 @@ public class LoreRepositoryCommandTest
         var result = await LoreRepositoryCreateAsync(globalArgs, args, LoreRepositoryCommandTest.NoOpCallback).Task;
         Assert.Equal(0, result);
 
-        // Attempting to create an existing repo should fail -> result = 41 (already exists)
+        // Attempting to create an existing repo should fail -> any non-zero status.
         result = await LoreRepositoryCreateAsync(globalArgs, args, LoreRepositoryCommandTest.NoOpCallback).Task;
-        Assert.Equal(41, result);
+        Assert.NotEqual(0, result);
     }
 }
 

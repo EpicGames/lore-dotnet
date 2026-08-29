@@ -9,6 +9,10 @@ Creates a C# enum from the C enum
 The value of each member is the one the header gives it, so an enum that is
 neither zero-based nor contiguous carries over as written.
 
+The underlying type is the signed `int` rather than `uint` so that negative
+enumerators (such as `LORE_ERROR_CODE_INTERNAL = -1`) both compile as members
+and marshal back off an interop struct field as written.
+
 For instance, for the `enum lore_metadata_type_t`
 
 typedef enum lore_metadata_type_t {
@@ -19,7 +23,7 @@ typedef enum lore_metadata_type_t {
 
 the result is:
 
-public enum LoreMetadataType : uint
+public enum LoreMetadataType : int
 {
     ADDRESS = 1,
     BOOLEAN = 2,
@@ -28,7 +32,7 @@ public enum LoreMetadataType : uint
 #}
 
 {% for enum_name, enum_values in symbols.enums.items() %}
-public enum {{pascal_case(enum_name.removesuffix("_t"))}} : uint
+public enum {{pascal_case(enum_name.removesuffix("_t"))}} : int
 {
     {% for value, number in enum_values %}
         {{value}} = {{number}},

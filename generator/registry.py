@@ -222,9 +222,9 @@ def detect_array_types(types_dict, enums_dict):
             element_cs_type_base = element_cs_type[:bracket_idx]
             element_cs_type_rank = element_cs_type[bracket_idx:]
         # Marshal.SizeOf<EnumType>() throws at runtime ("cannot be marshaled
-        # as an unmanaged structure"). C enums always marshal as uint here,
-        # so substitute uint for the size-of call on enum elements.
-        marshal_size_type = "uint" if category == "enum" else element_class
+        # as an unmanaged structure"). C enums always marshal as int here,
+        # so substitute int for the size-of call on enum elements.
+        marshal_size_type = "int" if category == "enum" else element_class
         detected.append(
             {
                 "array_c_type": struct_name,

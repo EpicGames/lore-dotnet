@@ -4,7 +4,47 @@ Copyright Epic Games, Inc. All Rights Reserved.
 Traverse the AST for the Lore header and generate the types and function wrappers
 """
 
+import operator
+
 from pycparser import c_ast
+
+def c_div(left, right):
+    """Integer division that truncates toward zero, as C does
+
+    Python's `//` floors instead, so it disagrees with C whenever exactly one
+    operand is negative: `-3 / 2` is `-1` in C but `-2` in Python.
+    """
+    quotient = abs(left) // abs(right)
+    return -quotient if (left < 0) != (right < 0) else quotient
+
+
+def c_mod(left, right):
+    """Remainder that takes the sign of the dividend, as C does
+
+    C defines `%` from truncating division, so `-3 % 2` is `-1`, while Python's
+    floor-based `%` gives `1`.
+    """
+    return left - c_div(left, right) * right
+
+
+UNARY_OPS = {
+    "+": operator.pos,
+    "-": operator.neg,
+    "~": operator.invert,
+}
+
+BINARY_OPS = {
+    "+": operator.add,
+    "-": operator.sub,
+    "*": operator.mul,
+    "/": c_div,
+    "%": c_mod,
+    "<<": operator.lshift,
+    ">>": operator.rshift,
+    "|": operator.or_,
+    "&": operator.and_,
+    "^": operator.xor,
+}
 
 
 class LoreVisitor(c_ast.NodeVisitor):
@@ -64,19 +104,42 @@ class LoreVisitor(c_ast.NodeVisitor):
 
         return fields
 
+    def _eval_enum_value(self, node, named_values):
+        """Evaluate an enumerator's constant expression, e.g. `-1` or `1 << 2`"""
+        if isinstance(node, c_ast.Constant):
+            return int(node.value.rstrip("uUlL"), 0)
+        elif isinstance(node, c_ast.UnaryOp):
+            return UNARY_OPS[node.op](self._eval_enum_value(node.expr, named_values))
+        elif isinstance(node, c_ast.BinaryOp):
+            return BINARY_OPS[node.op](
+                self._eval_enum_value(node.left, named_values),
+                self._eval_enum_value(node.right, named_values),
+            )
+        elif isinstance(node, c_ast.ID):
+            # A reference to an earlier enumerator of the same enum
+            return named_values[node.name]
+        else:
+            raise ValueError(f"Unsupported enumerator value: {node}")
+
     # pylint: disable=invalid-name
     def visit_Enum(self, node):
         """Visit nodes that are enums"""
         enum_name = node.name if node.name != "lore_event_id_t" else "lore_event_tag_t"
         value_prefix = enum_name.removesuffix("_t").removesuffix("_tag").upper() + "_"
 
-        values = [
-            (
-                e.name.removeprefix(value_prefix),
-                int(e.value.value, 0) if e.value else index,
+        values = []
+        named_values = {}
+        # An enumerator without an explicit value is the previous one plus one
+        next_value = 0
+
+        for e in node.values.enumerators:
+            value = (
+                self._eval_enum_value(e.value, named_values) if e.value else next_value
             )
-            for index, e in enumerate(node.values.enumerators)
-        ]
+            named_values[e.name] = value
+            next_value = value + 1
+            values.append((e.name.removeprefix(value_prefix), value))
+
         self.enums[enum_name] = values
 
     # pylint: disable=invalid-name
