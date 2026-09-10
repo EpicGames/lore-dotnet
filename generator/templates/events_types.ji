@@ -5,6 +5,7 @@ namespace LoreVcs.Types.Events;
 using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 using LoreVcs.Types;
 using LoreVcs.Types.Enums;
@@ -117,6 +118,7 @@ The result is:
         {
             private _{{ class_name }}* loreEvent;
             private bool disposed = false;
+            private LoreFfiLifetime? lifetime;
 
             private {{ class_name }}FFI(_{{ class_name }}* input)
             {
@@ -125,15 +127,22 @@ The result is:
 
             internal static {{ class_name }}FFI From(_{{ class_name }}* input) => new {{ class_name }}FFI(input);
 
-            private void VerifyPropertyAccess()
+            internal void AttachLifetime(LoreFfiLifetime? input) => lifetime = input;
+
+            {# Verifies the underlying event is still alive and holds a read
+               lease across the native-pointer dereference; must be paired with
+               EndPropertyAccess in a finally block. #}
+            private void BeginPropertyAccess()
             {
-                if (disposed || loreEvent == null)
+                if (disposed || loreEvent == null || (lifetime != null && !lifetime.TryEnterRead()))
                 {
                     throw new ObjectDisposedException(
                         "LoreEventFFI can be decoded only inside the event callback handler."
                     );
                 }
             }
+
+            private void EndPropertyAccess() => lifetime?.ExitRead();
 
             {% for field in struct_fields %}
                 {% set field_type = field.0 %}
@@ -158,22 +167,48 @@ The result is:
                     {% set return_type = prop_type.removeprefix("_") + "FFI" %}
                     public {{ return_type }} {{ pascal_case(field_name) }} {
                         get {
-                            VerifyPropertyAccess();
-                            fixed({{ prop_type }}* ptr = &loreEvent->{{ pascal_case(field_name) }})
+                            BeginPropertyAccess();
+                            try
                             {
-                                return {{ return_type }}.From(ptr);
+                                fixed({{ prop_type }}* ptr = &loreEvent->{{ pascal_case(field_name) }})
+                                {
+                                    var child = {{ return_type }}.From(ptr);
+                                    child.AttachLifetime(lifetime);
+                                    return child;
+                                }
+                            }
+                            finally
+                            {
+                                EndPropertyAccess();
                             }
                         }
                     }
                 {% else %}
+                    {% if field_type in ["lore_metadata_t", "lore_address_t", "lore_fragment_t"] or field_type in from_ffi_struct_types %}
+                    /**
+                    * <summary>
+                    * Returned by value carrying pointers into native event memory that
+                    * is only valid during the event callback. Do not store or Dispose()
+                    * the returned value. Call Clone() on it inside the callback to get
+                    * an owned copy that stays valid after the callback returns.
+                    * </summary>
+                    */
+                    {% endif %}
                     {% if prop_type == "byte" %}
                         public bool {{ pascal_case(field_name) }} {
                     {% else %}
                         public {{ prop_type }} {{ pascal_case(field_name) }} {
                     {% endif %}
                         get {
-                            VerifyPropertyAccess();
-                            return loreEvent->{{ pascal_case(field_name) }};
+                            BeginPropertyAccess();
+                            try
+                            {
+                                return loreEvent->{{ pascal_case(field_name) }};
+                            }
+                            finally
+                            {
+                                EndPropertyAccess();
+                            }
                         }
                     }
                 {% endif %}
@@ -181,7 +216,9 @@ The result is:
 
             public {{ class_name }} Clone()
             {
-                VerifyPropertyAccess();
+                BeginPropertyAccess();
+                try
+                {
                 return new {{ class_name }}
                 {
                     {% for field in struct_fields %}
@@ -195,7 +232,12 @@ The result is:
 
                         {% if field_type in ["lore_hash_t", "lore_context_t", "lore_partition_t", "lore_branch_id_t", "lore_repository_id_t", "lore_instance_id_t"] %}
                             {{ pascal_case(field_name) }} = {{ pascal_case(field_name) }}.Data,
+                        {# from_ffi_struct_types covers every struct generated by types.ji
+                           (e.g. lore_error_detail_t): their FFI getters return the struct
+                           with pointers into native event memory, so the deep Clone() is
+                           required to make the event data outlive the callback. #}
                         {% elif field_type in ["lore_metadata_t", "lore_address_t", "lore_fragment_t"]
+                            or field_type in from_ffi_struct_types
                             or field_type.endswith(("event_data_t", "event_data_array_t")) %}
                             {{ pascal_case(field_name) }} = {{ pascal_case(field_name) }}.Clone(),
                         {% else %}
@@ -203,6 +245,11 @@ The result is:
                         {% endif %}
                     {% endfor %}
                 };
+                }
+                finally
+                {
+                    EndPropertyAccess();
+                }
             }
 
             public void Dispose()
@@ -240,6 +287,46 @@ The result is:
 
             {% set tag = struct_name.removeprefix("lore_").removesuffix("_event_data_t") %}
             public {{ class_name }}() : base(LoreEventTag.{{ tag.upper() }}) {}
+
+            {# Fields produced by the FFI Clone() own unmanaged memory (deep-cloned
+               strings and arrays), so classes holding such fields free them on
+               Dispose, with a finalizer as the safety net when the user forgets. #}
+            {% set owning_fields = [] %}
+            {% for field in struct_fields %}
+                {% set field_type = field.0 %}
+                {% if field.2 != 0 %}
+                    {% set field_type = field_type.removesuffix("_t") + "_array_t" %}
+                {% endif %}
+                {% if field_type in ["lore_metadata_t", "lore_address_t", "lore_fragment_t"]
+                    or field_type in from_ffi_struct_types
+                    or field_type.endswith(("event_data_t", "event_data_array_t")) %}
+                    {% set _ = owning_fields.append((field_type, field.1)) %}
+                {% endif %}
+            {% endfor %}
+            {% if owning_fields %}
+                private bool disposed;
+
+                public override void Dispose()
+                {
+                    if (disposed)
+                        return;
+                    disposed = true;
+                    {% for field_type, field_name in owning_fields %}
+                        {% if field_type.endswith("event_data_array_t") %}
+                            if ({{ pascal_case(field_name) }} != null)
+                                foreach (var {{ field_name }}_element in {{ pascal_case(field_name) }})
+                                    {{ field_name }}_element?.Dispose();
+                        {% elif field_type.endswith("event_data_t") %}
+                            {{ pascal_case(field_name) }}?.Dispose();
+                        {% else %}
+                            {{ pascal_case(field_name) }}.Dispose();
+                        {% endif %}
+                    {% endfor %}
+                    GC.SuppressFinalize(this);
+                }
+
+                ~{{ class_name }}() => Dispose();
+            {% endif %}
         }
     {% endif %}
 {% endfor %}
@@ -285,6 +372,7 @@ public unsafe sealed class {{ arr.array_class }}FFI : IDisposable
 {
     private _{{ arr.array_class }}* loreEvent;
     private bool disposed = false;
+    private LoreFfiLifetime? lifetime;
 
     private {{ arr.array_class }}FFI(_{{ arr.array_class }}* input)
     {
@@ -293,9 +381,14 @@ public unsafe sealed class {{ arr.array_class }}FFI : IDisposable
 
     internal static {{ arr.array_class }}FFI From(_{{ arr.array_class }}* input) => new {{ arr.array_class }}FFI(input);
 
-    private void VerifyPropertyAccess()
+    internal void AttachLifetime(LoreFfiLifetime? input) => lifetime = input;
+
+    {# Verifies the underlying event is still alive and holds a read lease
+       across the native-pointer dereference; must be paired with
+       EndPropertyAccess in a finally block. #}
+    private void BeginPropertyAccess()
     {
-        if (disposed || loreEvent == null)
+        if (disposed || loreEvent == null || (lifetime != null && !lifetime.TryEnterRead()))
         {
             throw new ObjectDisposedException(
                 "LoreEventFFI can be decoded only inside the event callback handler."
@@ -303,9 +396,13 @@ public unsafe sealed class {{ arr.array_class }}FFI : IDisposable
         }
     }
 
+    private void EndPropertyAccess() => lifetime?.ExitRead();
+
     public {{ arr.element_class }}[] Clone()
     {
-        VerifyPropertyAccess();
+        BeginPropertyAccess();
+        try
+        {
         if (loreEvent->{{ arr.ptr_field }} == IntPtr.Zero) return Array.Empty<{{ arr.element_class }}>();
         if (loreEvent->{{ arr.count_field }} == 0) return Array.Empty<{{ arr.element_class }}>();
 
@@ -320,6 +417,11 @@ public unsafe sealed class {{ arr.array_class }}FFI : IDisposable
             }
         }
         return events;
+        }
+        finally
+        {
+            EndPropertyAccess();
+        }
     }
 
     public void Dispose()
@@ -335,10 +437,57 @@ Wrapper class for a Lore event.
 This class is non-owning and the data is only valid during the callback.
 
 #}
+{# Shared disposal state threaded from LoreEventFFI into every child FFI
+   wrapper minted from it (GetData results and nested event data), so
+   disposing the event at callback exit invalidates all of them — a stored
+   child wrapper then throws instead of reading freed native memory. #}
+internal sealed class LoreFfiLifetime
+{
+    {# Sign bit: disposed. Remaining bits: active read-lease count. #}
+    private int state;
+
+    internal bool TryEnterRead()
+    {
+        while (true)
+        {
+            int current = Volatile.Read(ref state);
+            if (current < 0)
+            {
+                return false;
+            }
+            if (Interlocked.CompareExchange(ref state, current + 1, current) == current)
+            {
+                return true;
+            }
+        }
+    }
+
+    internal void ExitRead() => Interlocked.Decrement(ref state);
+
+    internal void Dispose()
+    {
+        {# Set the disposed bit first so no new lease can be taken, then wait
+           for in-flight leases to drain before letting the callback return
+           (reader decrements preserve the sign bit while the count is nonzero). #}
+        int current;
+        do
+        {
+            current = Volatile.Read(ref state);
+        } while (
+            Interlocked.CompareExchange(ref state, current | int.MinValue, current) != current
+        );
+        var spinner = new SpinWait();
+        while (Volatile.Read(ref state) != int.MinValue)
+        {
+            spinner.SpinOnce();
+        }
+    }
+}
+
 public unsafe sealed class LoreEventFFI : IDisposable
 {
     private _LoreEvent* loreEvent;
-    private bool disposed = false;
+    private readonly LoreFfiLifetime lifetime = new();
 
     private LoreEventFFI(_LoreEvent* input){
         loreEvent = input;
@@ -346,66 +495,100 @@ public unsafe sealed class LoreEventFFI : IDisposable
 
     internal static LoreEventFFI From(_LoreEvent* input) => new LoreEventFFI(input);
 
-    private void VerifyPropertyAccess(){
-        if (disposed){
+    {# Verifies the event is still alive and holds a read lease for the whole
+       check-and-dereference, so the access cannot cross the disposal at
+       callback exit. See LoreFfiLifetime. Every Begin must be paired with
+       EndPropertyAccess in a finally block. #}
+    private void BeginPropertyAccess(){
+        if (!lifetime.TryEnterRead()){
             throw new ObjectDisposedException("LoreEventFFI can be decoded only inside the event callback handler.");
         }
     }
+
+    private void EndPropertyAccess() => lifetime.ExitRead();
 
     public LoreEventTag Tag
     {
         get
         {
-            VerifyPropertyAccess();
-            return loreEvent->Tag;
+            BeginPropertyAccess();
+            try
+            {
+                return loreEvent->Tag;
+            }
+            finally
+            {
+                EndPropertyAccess();
+            }
         }
     }
 
     public T GetData<T>()
     {
-        VerifyPropertyAccess();
+        BeginPropertyAccess();
+        try
+        {
+            {% for value, number in symbols.enums["lore_event_tag_t"] %}
+                {% set T = pascal_case("lore_" + value.lower() + "_event_data") %}
+                {% set type = pascal_case(value) %}
+                if (typeof(T) == typeof({{ T }}FFI) && Tag == LoreEventTag.{{ value.upper() }})
+                {
+                    var {{ value.lower() }}Data = loreEvent->{{ type }};
+                    {{ value.lower() }}Data.AttachLifetime(lifetime);
+                    return (T)(object){{ value.lower() }}Data;
+                }
+            {% endfor %}
 
-        {% for value, number in symbols.enums["lore_event_tag_t"] %}
-            {% set T = pascal_case("lore_" + value.lower() + "_event_data") %}
-            {% set type = pascal_case(value) %}
-            if (typeof(T) == typeof({{ T }}FFI) && Tag == LoreEventTag.{{ value.upper() }})
-            {
-                return (T)(object)loreEvent->{{ type }};
-            }
-        {% endfor %}
-
-        throw new InvalidOperationException($"Type {typeof(T).Name} does not match this event's tag.");
+            throw new InvalidOperationException($"Type {typeof(T).Name} does not match this event's tag.");
+        }
+        finally
+        {
+            EndPropertyAccess();
+        }
     }
 
     public LoreEvent Clone()
     {
-        VerifyPropertyAccess();
+        BeginPropertyAccess();
+        try
+        {
+            {% for value, number in symbols.enums["lore_event_tag_t"] %}
+                {% set T = pascal_case("lore_" + value.lower() + "_event_data") %}
+                {% set type = pascal_case(value) %}
+                if (Tag == LoreEventTag.{{ value.upper() }})
+                {
+                    return GetData<{{ T }}FFI>().Clone();
+                }
+            {% endfor %}
 
-        {% for value, number in symbols.enums["lore_event_tag_t"] %}
-            {% set T = pascal_case("lore_" + value.lower() + "_event_data") %}
-            {% set type = pascal_case(value) %}
-            if (Tag == LoreEventTag.{{ value.upper() }})
-            {
-                return GetData<{{ T }}FFI>().Clone();
-            }
-        {% endfor %}
-
-        throw new InvalidOperationException($"Unable to clone event, unknown tag {Tag}.");
+            throw new InvalidOperationException($"Unable to clone event, unknown tag {Tag}.");
+        }
+        finally
+        {
+            EndPropertyAccess();
+        }
     }
 
     public void Dispose()
     {
-        disposed = true;
+        lifetime.Dispose();
     }
 }
 
-public abstract class LoreEvent
+public abstract class LoreEvent : IDisposable
 {
     public LoreEventTag Tag { get; }
 
     protected LoreEvent(LoreEventTag tag)
     {
         Tag = tag;
+    }
+
+    {# Overridden by the event data classes whose fields own unmanaged memory
+       (deep-cloned strings and arrays). A no-op for the rest. #}
+    public virtual void Dispose()
+    {
+        GC.SuppressFinalize(this);
     }
 }
 

@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using Xunit;
 using LoreVcs.Types;
 using LoreVcs.Types.Enums;
+using LoreVcs.Types.Events;
 
 namespace LoreVcs.Tests;
 
@@ -591,5 +592,175 @@ public class LoreCustomTypesTests
         Assert.True(native[1].Streaming);
 
         arr.Dispose();
+    }
+
+    /// <summary>
+    /// Mirrors LoreString layout with public fields so tests can craft a
+    /// LoreString view over a buffer they control, mimicking an FFI view of
+    /// native event memory that is only valid during the event callback.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct LoreStringBuilder
+    {
+        public IntPtr ptr;
+        public nuint length;
+    }
+
+    /// <summary>Mirrors LoreTraceLocationArray layout (pointer + count).</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct LoreTraceLocationArrayBuilder
+    {
+        public IntPtr ptr;
+        public nuint count;
+    }
+
+    /// <summary>Mirrors LoreTraceLocation layout with public fields.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct LoreTraceLocationBuilder
+    {
+        public LoreString file;
+        public uint line;
+        public uint column;
+        public LoreString context;
+    }
+
+    /// <summary>Mirrors LoreErrorDetail layout with public fields.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct LoreErrorDetailBuilder
+    {
+        public int error_code;
+        public LoreString message;
+        public LoreTraceLocationArray trace_locations;
+    }
+
+    private static LoreString CraftLoreString(string value, out IntPtr buffer)
+    {
+        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(value);
+        buffer = Marshal.AllocHGlobal(bytes.Length);
+        Marshal.Copy(bytes, 0, buffer, bytes.Length);
+        var builder = new LoreStringBuilder { ptr = buffer, length = (nuint)bytes.Length };
+        return Unsafe.As<LoreStringBuilder, LoreString>(ref builder);
+    }
+
+    private static void OverwriteBuffer(IntPtr buffer, string value)
+    {
+        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(value);
+        Marshal.Copy(bytes, 0, buffer, bytes.Length);
+    }
+
+    [Fact]
+    public void LoreErrorDetail_Clone_MessageSurvivesSourceMemoryReuse()
+    {
+        // The FFI event getters hand out LoreErrorDetail values whose string
+        // pointers reference native event memory owned by the caller of the
+        // event callback. Clone() must copy that memory so the clone stays
+        // valid after the callback returns and the event memory is reused.
+        var detailBuilder = new LoreErrorDetailBuilder
+        {
+            error_code = -1,
+            message = CraftLoreString("original message", out IntPtr messageBuffer),
+        };
+        var detail = Unsafe.As<LoreErrorDetailBuilder, LoreErrorDetail>(ref detailBuilder);
+
+        var clone = detail.Clone();
+
+        // Simulate the native side reusing the event memory after the callback.
+        OverwriteBuffer(messageBuffer, "hijacked message");
+
+        Assert.Equal(-1, clone.ErrorCode);
+        Assert.Equal("original message", clone.Message);
+
+        Marshal.FreeHGlobal(messageBuffer);
+    }
+
+    [Fact]
+    public void LoreErrorDetail_Clone_TraceLocationsSurviveSourceMemoryReuse()
+    {
+        // Same as above, one level deeper: the trace location array elements
+        // hold string pointers of their own, so Clone() must copy the array
+        // AND each element's strings.
+        var locationBuilder = new LoreTraceLocationBuilder
+        {
+            file = CraftLoreString("src/original.rs", out IntPtr fileBuffer),
+            line = 42,
+            column = 7,
+            context = CraftLoreString("original context", out IntPtr contextBuffer),
+        };
+
+        IntPtr elementsBuffer = Marshal.AllocHGlobal(Marshal.SizeOf<LoreTraceLocation>());
+        Marshal.StructureToPtr(
+            Unsafe.As<LoreTraceLocationBuilder, LoreTraceLocation>(ref locationBuilder),
+            elementsBuffer,
+            false
+        );
+        var arrayBuilder = new LoreTraceLocationArrayBuilder
+        {
+            ptr = elementsBuffer,
+            count = 1,
+        };
+
+        var detailBuilder = new LoreErrorDetailBuilder
+        {
+            error_code = -1,
+            message = CraftLoreString("original message", out IntPtr messageBuffer),
+            trace_locations = Unsafe.As<
+                LoreTraceLocationArrayBuilder,
+                LoreTraceLocationArray
+            >(ref arrayBuilder),
+        };
+        var detail = Unsafe.As<LoreErrorDetailBuilder, LoreErrorDetail>(ref detailBuilder);
+
+        var clone = detail.Clone();
+
+        // Simulate the native side reusing the event memory after the callback.
+        OverwriteBuffer(fileBuffer, "src/hijacked.rs");
+        OverwriteBuffer(contextBuffer, "hijacked context");
+        OverwriteBuffer(messageBuffer, "hijacked message");
+
+        Assert.Equal("original message", clone.Message);
+        var locations = clone.TraceLocations;
+        Assert.Single(locations);
+        Assert.Equal("src/original.rs", locations[0].File);
+        Assert.Equal(42u, locations[0].Line);
+        Assert.Equal(7u, locations[0].Column);
+        Assert.Equal("original context", locations[0].Context);
+
+        Marshal.FreeHGlobal(fileBuffer);
+        Marshal.FreeHGlobal(contextBuffer);
+        Marshal.FreeHGlobal(messageBuffer);
+        Marshal.FreeHGlobal(elementsBuffer);
+    }
+
+    [Fact]
+    public void LoreEventData_OwningClonedMemory_IsDisposable()
+    {
+        // Cloned event data owns unmanaged copies of the FFI strings/arrays
+        // (see the Clone tests above), so the managed event classes must be
+        // disposable to release that memory.
+        Assert.IsAssignableFrom<IDisposable>(new LoreCompleteEventData());
+        Assert.IsAssignableFrom<IDisposable>(new LoreMetadataEventData());
+    }
+
+    [Fact]
+    public void LoreEventData_Dispose_IsIdempotentAndLeavesSourceIntact()
+    {
+        var detailBuilder = new LoreErrorDetailBuilder
+        {
+            error_code = -1,
+            message = CraftLoreString("original message", out IntPtr messageBuffer),
+        };
+        var detail = Unsafe.As<LoreErrorDetailBuilder, LoreErrorDetail>(ref detailBuilder);
+
+        var eventData = new LoreCompleteEventData { Status = -1, Error = detail.Clone() };
+
+        var disposable = Assert.IsAssignableFrom<IDisposable>(eventData);
+        disposable.Dispose();
+        // Dispose must be idempotent: a second call must not double-free.
+        disposable.Dispose();
+
+        // Disposing the event only frees the clone's memory, not the source's.
+        Assert.Equal("original message", detail.Message);
+
+        Marshal.FreeHGlobal(messageBuffer);
     }
 }

@@ -702,7 +702,43 @@ public class LoreEventCallbackConfig{
                 {% endif %}
             {% endfor %}
 
-            public {{ class_name }} Clone() => this;
+            {# Deep-copy fields that own unmanaged pointers, so the clone stays valid after
+               the source memory (e.g. native event memory backing an FFI view) is freed or
+               reused, and so source and clone do not double-free on Dispose. Fixed-size
+               buffer fields (hashes, contexts, ids) are copied by the struct assignment
+               itself. #}
+            public {{ class_name }} Clone()
+            {
+                var result = this;
+                {% for field in struct_fields %}
+                    {% set field_type = field.0 %}
+                    {% set field_name = field.1 %}
+                    {% set field_array_size = field.2 %}
+                    {% if field_array_size != 0 %}
+                        {% set field_type = field_type.removesuffix("_t") + "_array_t" %}
+                    {% endif %}
+                    {% if field_type in blit_types %}
+                        {% set blit_class = pascal_case(field_type.removesuffix("_t")) %}
+                        {% set field_ref = utils.escape_reserved_word(field_name) %}
+                        {% if field_type == "lore_metadata_t" %}
+                            result.{{ field_ref }} = {{ field_ref }}.Clone();
+                        {% elif field_type in ["lore_string_t", "lore_binary_t", "lore_bytes_t"] %}
+                            result.{{ field_ref }} = new {{ blit_class }}({{ blit_class }}.ToNative({{ field_ref }}));
+                        {% elif field_type.endswith("_array_t") %}
+                            {% set element_type = field_type.removesuffix("_array_t") + "_t" %}
+                            {% if element_type in from_ffi_struct_types %}
+                                var {{ field_name }}_elements = {{ blit_class }}.ToNative({{ field_ref }});
+                                for (int i = 0; i < {{ field_name }}_elements.Length; ++i)
+                                    {{ field_name }}_elements[i] = {{ field_name }}_elements[i].Clone();
+                                result.{{ field_ref }} = new {{ blit_class }}({{ field_name }}_elements);
+                            {% else %}
+                                result.{{ field_ref }} = new {{ blit_class }}({{ blit_class }}.ToNative({{ field_ref }}));
+                            {% endif %}
+                        {% endif %}
+                    {% endif %}
+                {% endfor %}
+                return result;
+            }
 
             public void Dispose()
             {

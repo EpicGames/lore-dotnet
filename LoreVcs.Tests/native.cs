@@ -5,6 +5,7 @@ using LoreVcs.Types.Args;
 using LoreVcs.Types.Enums;
 using LoreVcs.Types.Events;
 using static LoreVcs.Interop.Native;
+using System.Threading;
 using System.Threading.Tasks;
 
 [assembly: CollectionBehavior(DisableTestParallelization = true)]
@@ -198,6 +199,121 @@ public class LoreRepositoryCommandTest
                 Console.WriteLine($"Message: {ev.Message}");
             }
         });
+    }
+
+    private static List<LoreLogEventDataFFI> undisposedLogEventsFFI = new();
+
+    static void StoreUndisposedLoreLogEventFFICallbackHandler(
+        LoreEventFFI loreEvent,
+        ulong userContext
+    )
+    {
+        if (loreEvent.Tag == LoreEventTag.LOG)
+        {
+            // No `using` here: the wrapper escapes the callback undisposed. It
+            // must still be invalidated when the parent event is disposed at
+            // callback exit.
+            undisposedLogEventsFFI.Add(loreEvent.GetData<LoreLogEventDataFFI>());
+        }
+    }
+
+    [Fact]
+    public void Use_Undisposed_LoreLogEventFFI_After_Callback_Throws()
+    {
+        var args = new LoreRepositoryCreateArgs { RepositoryUrl = Guid.NewGuid().ToString() };
+        var callback = new LoreEventCallbackConfig
+        {
+            Func = StoreUndisposedLoreLogEventFFICallbackHandler,
+        };
+        var result = LoreRepositoryCreate(globalArgs, args, callback);
+        Assert.Equal(0, result);
+
+        Assert.NotEmpty(undisposedLogEventsFFI);
+        Assert.Throws<ObjectDisposedException>(() =>
+        {
+            foreach (LoreLogEventDataFFI ev in undisposedLogEventsFFI)
+            {
+                Console.WriteLine($"Message: {ev.Message}");
+            }
+        });
+    }
+
+    [Fact]
+    public void Concurrent_Reader_Of_Stored_Wrapper_Sees_Data_Or_Throws()
+    {
+        // Regression stress test for the disposal race: a wrapper stored from
+        // the callback and hammered from another thread must only ever observe
+        // valid data or ObjectDisposedException. The read lease held across
+        // each access guarantees no read overlaps the disposal at callback
+        // exit (which would dereference freed native memory and could crash
+        // the process).
+        LoreLogEventDataFFI shared = null!;
+        bool stop = false;
+        Exception readerFailure = null!;
+
+        var reader = new Thread(() =>
+        {
+            try
+            {
+                while (!Volatile.Read(ref stop))
+                {
+                    var wrapper = Volatile.Read(ref shared);
+                    if (wrapper == null)
+                    {
+                        continue;
+                    }
+                    try
+                    {
+                        _ = wrapper.Message;
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // Expected once the callback has returned.
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                readerFailure = e;
+            }
+        });
+        reader.Start();
+
+        try
+        {
+            var callback = new LoreEventCallbackConfig
+            {
+                Func = (loreEvent, _) =>
+                {
+                    if (loreEvent.Tag == LoreEventTag.LOG)
+                    {
+                        Volatile.Write(ref shared, loreEvent.GetData<LoreLogEventDataFFI>());
+                    }
+                },
+            };
+            for (int i = 0; i < 20; ++i)
+            {
+                var args = new LoreRepositoryCreateArgs
+                {
+                    RepositoryUrl = Guid.NewGuid().ToString(),
+                };
+                // Only the first create succeeds; the repeats fail against the
+                // same repository path but still emit the LOG event traffic
+                // (and per-event disposals) this stress test races against.
+                var result = LoreRepositoryCreate(globalArgs, args, callback);
+                if (i == 0)
+                {
+                    Assert.Equal(0, result);
+                }
+            }
+        }
+        finally
+        {
+            Volatile.Write(ref stop, true);
+            reader.Join();
+        }
+
+        Assert.Null(readerFailure);
     }
 
     static void StoreLoreLogEventCallbackHandler(LoreEventFFI loreEvent, ulong userContext)
