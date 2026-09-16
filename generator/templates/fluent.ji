@@ -9,6 +9,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Runtime.ExceptionServices;
+using System.Text;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using System.Threading;
@@ -22,87 +23,124 @@ public delegate int LoreFunction<LoreArgs>(in LoreGlobalArgs globalArgs, in Lore
 public delegate TaskCompletionSource<int> LoreFunctionAsync<LoreArgs>(in LoreGlobalArgs globalArgs, in LoreArgs args, LoreEventCallbackConfig callback);
 
 /// <summary>
-/// Thrown when a Lore operation finishes with a non-zero return code. The
-/// message is built from the ERROR events emitted during the operation,
-/// falling back to the failed COMPLETE event's error message when no ERROR
-/// event was emitted, so an explicit error always takes precedence.
+/// A managed copy of one trace location from the error detail of a failed
+/// COMPLETE event.
 /// </summary>
-public sealed class LoreError : Exception
+public sealed class LoreErrorTraceLocation
 {
-    public int ReturnCode { get; }
-    public IReadOnlyList<string> Messages { get; }
+    public string File { get; }
+    public uint Line { get; }
+    public uint Column { get; }
+    public string Context { get; }
 
-    public LoreError(int returnCode, IReadOnlyList<string>? messages = null)
-        : base(BuildMessage(returnCode, messages))
+    public LoreErrorTraceLocation(string file, uint line, uint column, string context)
     {
-        ReturnCode = returnCode;
-        Messages = messages ?? Array.Empty<string>();
-    }
-
-    private static string BuildMessage(int returnCode, IReadOnlyList<string>? messages)
-    {
-        if (messages != null && messages.Count > 0)
-        {
-            return $"Lore operation failed with code {returnCode}: {string.Join("; ", messages)}";
-        }
-        return $"Lore operation failed with code {returnCode}";
+        File = file;
+        Line = line;
+        Column = column;
+        Context = context;
     }
 }
 
 /// <summary>
-/// Accumulates error context from the terminal events of a Lore operation: the
-/// message of every ERROR event, and the error message of a failed COMPLETE
-/// event (non-zero status). The COMPLETE message is only surfaced when no ERROR
-/// event was recorded, so an explicit error always takes precedence.
+/// A managed copy of the LoreErrorDetail surfaced by the COMPLETE event of a
+/// failed operation: the error code, message and captured trace locations.
+/// </summary>
+public sealed class LoreErrorDetailData
+{
+    public int ErrorCode { get; }
+    public string Message { get; }
+    public IReadOnlyList<LoreErrorTraceLocation> TraceLocations { get; }
+
+    public LoreErrorDetailData(int errorCode, string message, IReadOnlyList<LoreErrorTraceLocation> traceLocations)
+    {
+        ErrorCode = errorCode;
+        Message = message;
+        TraceLocations = traceLocations;
+    }
+}
+
+/// <summary>
+/// Thrown when a Lore operation finishes with a non-zero return code. The
+/// message is built from the error detail surfaced by the failed COMPLETE
+/// event: the error code, message and captured trace locations.
+/// </summary>
+public sealed class LoreError : Exception
+{
+    public int ReturnCode { get; }
+    public LoreErrorDetailData? ErrorDetail { get; }
+
+    public LoreError(int returnCode, LoreErrorDetailData? errorDetail = null)
+        : base(BuildMessage(returnCode, errorDetail))
+    {
+        ReturnCode = returnCode;
+        ErrorDetail = errorDetail;
+    }
+
+    private static string BuildMessage(int returnCode, LoreErrorDetailData? errorDetail)
+    {
+        if (errorDetail == null)
+        {
+            return $"Lore operation failed with code {returnCode}";
+        }
+        var message = new StringBuilder();
+        message.Append($"Lore error {errorDetail.ErrorCode}: {errorDetail.Message}");
+        foreach (var location in errorDetail.TraceLocations)
+        {
+            message.Append($"\n    at {location.File}:{location.Line}:{location.Column}");
+            if (!string.IsNullOrEmpty(location.Context))
+            {
+                message.Append($" ({location.Context})");
+            }
+        }
+        return message.ToString();
+    }
+}
+
+/// <summary>
+/// Records the error detail of a failed COMPLETE event (non-zero status) so it
+/// can be surfaced when the operation fails. The detail is decoded to managed
+/// data inside the callback, since the event memory is only valid there.
 ///
 /// Recording happens on a lorelib worker thread while the calling thread reads
 /// the result, so both sides take the lock.
 /// </summary>
-internal sealed class TerminalEventRecorder
+internal sealed class CompleteErrorRecorder
 {
     private readonly object gate = new();
-    private readonly List<string> errorMessages = new();
-    private string? completeError;
+    private LoreErrorDetailData? errorDetail;
 
     public void Record(LoreEventFFI loreEvent)
     {
-        if (loreEvent.Tag == LoreEventTag.ERROR)
+        if (loreEvent.Tag != LoreEventTag.COMPLETE)
         {
-            var message = loreEvent.GetData<LoreErrorEventDataFFI>().ErrorInner;
-            lock (gate)
-            {
-                errorMessages.Add(message);
-            }
+            return;
         }
-        else if (loreEvent.Tag == LoreEventTag.COMPLETE)
+        var data = loreEvent.GetData<LoreCompleteEventDataFFI>();
+        if (data.Status == 0)
         {
-            var data = loreEvent.GetData<LoreCompleteEventDataFFI>();
-            if (data.Status != 0)
-            {
-                var message = data.Error.Message;
-                lock (gate)
-                {
-                    completeError = message;
-                }
-            }
+            return;
+        }
+        var error = data.Error;
+        var traceLocations = new List<LoreErrorTraceLocation>();
+        foreach (var location in error.TraceLocations)
+        {
+            traceLocations.Add(
+                new LoreErrorTraceLocation(location.File, location.Line, location.Column, location.Context)
+            );
+        }
+        var detail = new LoreErrorDetailData(error.ErrorCode, error.Message, traceLocations);
+        lock (gate)
+        {
+            errorDetail = detail;
         }
     }
 
-    // ERROR event messages take precedence; otherwise fall back to the failed
-    // COMPLETE event's error message when one was recorded.
-    public IReadOnlyList<string> Messages()
+    public LoreErrorDetailData? ErrorDetail()
     {
         lock (gate)
         {
-            if (errorMessages.Count > 0)
-            {
-                return new List<string>(errorMessages);
-            }
-            if (!string.IsNullOrEmpty(completeError))
-            {
-                return new List<string> { completeError };
-            }
-            return Array.Empty<string>();
+            return errorDetail;
         }
     }
 }
@@ -120,7 +158,7 @@ public sealed class LoreExecutor<LoreArgs>
     private Channel<LoreEvent> channel;
     private ulong userContext;
     private bool terminated;
-    private TerminalEventRecorder recorder = new();
+    private CompleteErrorRecorder recorder = new();
     private Exception? callbackException;
 
     private bool Accepts(LoreEventTag tag) => filterTags.Count == 0 || filterTags.Contains(tag);
@@ -240,7 +278,7 @@ public sealed class LoreExecutor<LoreArgs>
     {
         if (returnCode != 0)
         {
-            throw new LoreError(returnCode, recorder.Messages());
+            throw new LoreError(returnCode, recorder.ErrorDetail());
         }
     }
 
@@ -270,7 +308,7 @@ public sealed class LoreExecutor<LoreArgs>
     {
         VerifyTermination();
         terminated = true;
-        recorder = new TerminalEventRecorder();
+        recorder = new CompleteErrorRecorder();
         var callback = new LoreEventCallbackConfig { UserContext = userContext, Func = WaitEventHandler };
         var returnCode = function(globalArgs, args, callback);
         ThrowIfCallbackFailed();
@@ -289,7 +327,7 @@ public sealed class LoreExecutor<LoreArgs>
     {
         VerifyTermination();
         terminated = true;
-        recorder = new TerminalEventRecorder();
+        recorder = new CompleteErrorRecorder();
         var callback = new LoreEventCallbackConfig { UserContext = userContext, Func = WaitEventHandler };
         // functionAsync starts the operation eagerly (so multiple WaitAsync()
         // calls run concurrently); awaiting its Task yields the return code.
@@ -303,7 +341,7 @@ public sealed class LoreExecutor<LoreArgs>
     {
         VerifyTermination();
         terminated = true;
-        recorder = new TerminalEventRecorder();
+        recorder = new CompleteErrorRecorder();
         var callback = new LoreEventCallbackConfig { UserContext = userContext, Func = AsyncIterEventHandler };
         var taskCompletionSource = functionAsync(globalArgs, args, callback);
         // A source already faulted on return means the call never reached
@@ -333,7 +371,7 @@ public sealed class LoreExecutor<LoreArgs>
     {
         VerifyTermination();
         terminated = true;
-        recorder = new TerminalEventRecorder();
+        recorder = new CompleteErrorRecorder();
 
         collectedEvents.Clear();
         var callback = new LoreEventCallbackConfig { UserContext = userContext, Func = CollectEventHandler };
@@ -352,7 +390,7 @@ public sealed class LoreExecutor<LoreArgs>
     {
         VerifyTermination();
         terminated = true;
-        recorder = new TerminalEventRecorder();
+        recorder = new CompleteErrorRecorder();
 
         collectedEvents.Clear();
         var callback = new LoreEventCallbackConfig { UserContext = userContext, Func = CollectEventHandler };
