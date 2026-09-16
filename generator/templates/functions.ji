@@ -267,6 +267,22 @@ public static class Native
     [DllImport(LORELIB, CallingConvention=CallingConvention.Cdecl)]
     internal static extern int lore_set_thread_limit(nuint count);
 
+    public unsafe static int LoreSetCompressionMode(LoreCompressionMode mode)
+    {
+        return lore_set_compression_mode((uint)mode);
+    }
+
+    [DllImport(LORELIB, CallingConvention=CallingConvention.Cdecl)]
+    internal static extern int lore_set_compression_mode(uint mode);
+
+    public unsafe static int LoreSetCompressionLevel(int level)
+    {
+        return lore_set_compression_level(level);
+    }
+
+    [DllImport(LORELIB, CallingConvention=CallingConvention.Cdecl)]
+    internal static extern int lore_set_compression_level(int level);
+
     public unsafe static int LoreShutdown()
     {
         return lore_shutdown();

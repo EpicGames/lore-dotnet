@@ -401,6 +401,16 @@ public sealed class Lore
         return LoreSetThreadLimit(count);
     }
 
+    public static int SetCompressionMode(LoreCompressionMode mode)
+    {
+        return LoreSetCompressionMode(mode);
+    }
+
+    public static int SetCompressionLevel(int level)
+    {
+        return LoreSetCompressionLevel(level);
+    }
+
     public static void Shutdown()
     {
         var result = LoreShutdown();

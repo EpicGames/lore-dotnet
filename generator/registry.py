@@ -120,6 +120,8 @@ UNCOMMON_FUNCTIONS = [
     "lore_version",
     "lore_user_directory",
     "lore_set_thread_limit",
+    "lore_set_compression_mode",
+    "lore_set_compression_level",
 ]
 
 
